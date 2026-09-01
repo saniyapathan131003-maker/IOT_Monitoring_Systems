@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+venv_new/
+.env
+
+# Node.js
+node_modules/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# AWS / TLS certificates and private keys
+*.pem
+*.pem.key
+*.crt
+
+# VS Code
+.vscode/

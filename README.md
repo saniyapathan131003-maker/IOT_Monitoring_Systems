@@ -94,7 +94,9 @@ output like that : -
 30: -- -- -- -- -- -- -- -- -- -- -- --
 40: -- -- -- -- -- -- -- -- 48 -- -- --
 50: -- -- -- -- -- -- -- -- -- -- -- --
-
+# install ADS1115 Module 
+pip install adafruit-blinka
+pip install adafruit-circuitpython-ads1x15
 ## FOR VIRTUAL ENVIROMENT CODING :-
 python3 -m venv venv
 ## SD Card Setup :

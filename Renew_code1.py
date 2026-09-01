@@ -4,6 +4,8 @@ import time
 import sys
 import sqlite3
 import os
+import serial
+import pynmea2
 
 
 # =====================================================
@@ -112,12 +114,12 @@ try:
 
     else:
 
-        DEVICE_ID = "Raspberry4_8"
+        DEVICE_ID = "UNKNOWN"
 
 
 except:
 
-    DEVICE_ID = "Raspberry4_8"
+    DEVICE_ID = ""
 
 
 
@@ -361,7 +363,30 @@ except Exception as e:
         e
     )
 
+# =====================================================
+# GPS SETUP
+# =====================================================
 
+GPS_PORT = "/dev/ttyAMA3"
+GPS_BAUD = 38400
+
+gps = None
+
+try:
+
+    gps = serial.Serial(
+        GPS_PORT,
+        GPS_BAUD,
+        timeout=1
+    )
+
+    print("✅ GPS Connected")
+
+except Exception as e:
+
+    print("GPS Error:", e)
+
+    gps = None
 
 
 # =====================================================
@@ -489,7 +514,55 @@ def insert_database(data,timestamp):
 
     conn.commit()
 
+# =====================================================
+# GPS READ
+# =====================================================
 
+def read_gps():
+
+    gps_data = {
+
+        "status": "NO FIX",
+        "SAT": 0,
+        "LAT": 0.0,
+        "LON": 0.0,
+        "ALT": 0.0
+
+    }
+
+    if gps is None:
+        return gps_data
+
+    try:
+
+        while gps.in_waiting:
+
+            line = gps.readline().decode(
+                "ascii",
+                errors="ignore"
+            ).strip()
+
+            if line.startswith("$GNGGA") or line.startswith("$GPGGA"):
+
+                msg = pynmea2.parse(line)
+
+                gps_data["status"] = "FIX"
+
+                gps_data["SAT"] = int(msg.num_sats)
+
+                gps_data["LAT"] = msg.latitude
+
+                gps_data["LON"] = msg.longitude
+
+                gps_data["ALT"] = float(msg.altitude)
+
+                break
+
+    except Exception as e:
+
+        print("GPS Read Error:", e)
+
+    return gps_data
 
 
 # =====================================================
@@ -582,6 +655,7 @@ try:
 
 
         data = read_raw_values()
+        gps_data = read_gps()
 
 
 
@@ -612,7 +686,7 @@ try:
             f"Battery_raw = {data['Battery_raw']}, "
             f"Battery_voltage = {data['Battery_voltage']} V"
         )
-
+        
 
         print()
 
@@ -621,6 +695,7 @@ try:
             "timestamp =",
             timestamp
         )
+        
 
 
         print()
@@ -630,7 +705,7 @@ try:
             f"ADS1115_0x48 = {ADS048_STATUS}, "
             f"ADS1115_0x49 = {ADS049_STATUS}"
         )
-
+    
 
 
         if check_raw_change(data):
@@ -670,7 +745,7 @@ except KeyboardInterrupt:
 
 
     print(
-        "\nStopping HAMS Capture"
+        "\nStopping BRAKE BINDING Capture"
     )
 
 

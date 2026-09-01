@@ -1,7 +1,7 @@
+# ============================================================
 # Raspberry Pi – ADS1115 4-Channel Pressure Data Logger
+# ============================================================
 
-#
-# python
 import os
 import time
 import sqlite3
@@ -19,25 +19,33 @@ from adafruit_ads1x15.analog_in import AnalogIn
 
 DB_PATH = "db/test1_db.db"
 
-# ADS1115 configuration
+# ADS1115 I2C address
+# Raspberry Pi detected both 0x48 and 0x49.
+# Change to 0x49 if your required ADS1115 is at 0x49.
+ADS1115_ADDRESS = 0x48
+
+# ADS1115 gain
 ADC_GAIN = 1
 
 # 160-ohm shunt resistor for 4-20 mA
 SHUNT_RESISTOR = 160.0
 
-# Pressure transmitter configuration
-CURRENT_MIN = 4.0      # mA
-CURRENT_MAX = 20.0     # mA
+# Pressure transmitter
+CURRENT_MIN = 4.0       # mA
+CURRENT_MAX = 20.0      # mA
 
-PRESSURE_MIN = 0.0     # bar
-PRESSURE_MAX = 10.0    # bar
+PRESSURE_MIN = 0.0      # bar
+PRESSURE_MAX = 10.0     # bar
 
 
 # ============================================================
 # CREATE DATABASE DIRECTORY
 # ============================================================
 
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+db_directory = os.path.dirname(DB_PATH)
+
+if db_directory:
+    os.makedirs(db_directory, exist_ok=True)
 
 
 # ============================================================
@@ -71,13 +79,15 @@ def init_database():
 # SAVE READING TO DATABASE
 # ============================================================
 
-def save_reading(timestamp,
-                 sensor,
-                 adc_channel,
-                 raw_value,
-                 adc_voltage,
-                 current_ma,
-                 pressure_ideal):
+def save_reading(
+    timestamp,
+    sensor,
+    adc_channel,
+    raw_value,
+    adc_voltage,
+    current_ma,
+    pressure_ideal
+):
 
     conn = sqlite3.connect(DB_PATH)
 
@@ -109,18 +119,19 @@ def save_reading(timestamp,
 
 
 # ============================================================
-# CURRENT CALCULATION
+# VOLTAGE → CURRENT
 # ============================================================
 
 def voltage_to_current(voltage):
     """
-    Calculate 4-20 mA current using the 160 ohm shunt resistor.
+    Convert shunt voltage to current.
 
     I = V / R
 
-    Example:
-    4 mA  -> 0.64 V
-    20 mA -> 3.20 V
+    160 ohm shunt:
+
+    4 mA  = 0.64 V
+    20 mA = 3.20 V
     """
 
     current_amp = voltage / SHUNT_RESISTOR
@@ -131,20 +142,15 @@ def voltage_to_current(voltage):
 
 
 # ============================================================
-# PRESSURE CALCULATION
+# CURRENT → PRESSURE
 # ============================================================
 
 def current_to_pressure(current_ma):
     """
-    Convert 4-20 mA transmitter output to pressure.
+    Convert 4-20 mA to 0-10 bar.
 
     4 mA  = 0 bar
     20 mA = 10 bar
-
-    Linear conversion:
-
-    Pressure =
-        ((Current - 4) / 16) * 10
     """
 
     pressure = (
@@ -152,13 +158,9 @@ def current_to_pressure(current_ma):
         / (CURRENT_MAX - CURRENT_MIN)
     ) * (PRESSURE_MAX - PRESSURE_MIN) + PRESSURE_MIN
 
-    # Prevent small negative values caused by noise
-    if pressure < PRESSURE_MIN:
-        pressure = PRESSURE_MIN
-
-    # Prevent values above maximum range
-    if pressure > PRESSURE_MAX:
-        pressure = PRESSURE_MAX
+    # Limit pressure to configured range
+    pressure = max(PRESSURE_MIN, pressure)
+    pressure = min(PRESSURE_MAX, pressure)
 
     return pressure
 
@@ -167,40 +169,71 @@ def current_to_pressure(current_ma):
 # ADS1115 INITIALIZATION
 # ============================================================
 
+print("Initializing I2C...")
+
 i2c = busio.I2C(
     board.SCL,
     board.SDA
 )
 
-ads = ADS1115(i2c)
+
+# ============================================================
+# ADS1115
+# ============================================================
+
+print(
+    f"Initializing ADS1115 at address "
+    f"0x{ADS1115_ADDRESS:02X}..."
+)
+
+ads = ADS1115(
+    i2c,
+    address=ADS1115_ADDRESS
+)
 
 ads.gain = ADC_GAIN
+
+
+print("ADS1115 initialized successfully.")
 
 
 # ============================================================
 # CHANNEL CONFIGURATION
 # ============================================================
 
+# IMPORTANT:
+# Do NOT use ADS1115.P0 / ADS1115.P1.
+#
+# Correct:
+# AnalogIn(ads, 0)
+# AnalogIn(ads, 1)
+# AnalogIn(ads, 2)
+# AnalogIn(ads, 3)
+
 bp_channel = AnalogIn(
     ads,
-    ADS1115.P0
+    0
 )
 
 fp_channel = AnalogIn(
     ads,
-    ADS1115.P1
+    1
 )
 
 cr_channel = AnalogIn(
     ads,
-    ADS1115.P2
+    2
 )
 
 bc_channel = AnalogIn(
     ads,
-    ADS1115.P3
+    3
 )
 
+
+# ============================================================
+# SENSOR CONFIGURATION
+# ============================================================
 
 channels = {
 
@@ -233,9 +266,18 @@ channels = {
 init_database()
 
 
+# ============================================================
+# START MESSAGE
+# ============================================================
+
+print()
 print("==============================================")
 print(" ADS1115 4-Channel Pressure Data Logger")
 print("==============================================")
+print(f"ADS1115 Address : 0x{ADS1115_ADDRESS:02X}")
+print(f"ADC Gain        : {ADC_GAIN}")
+print(f"Shunt Resistor  : {SHUNT_RESISTOR} ohm")
+print("----------------------------------------------")
 print("A0 -> BP")
 print("A1 -> FP")
 print("A2 -> CR")
@@ -243,6 +285,11 @@ print("A3 -> BC")
 print("----------------------------------------------")
 print("Database:", DB_PATH)
 print("----------------------------------------------")
+print("4 mA  -> 0.64 V -> 0 bar")
+print("20 mA -> 3.20 V -> 10 bar")
+print("----------------------------------------------")
+print("Logging started...")
+print()
 
 
 # ============================================================
@@ -262,73 +309,90 @@ try:
             adc_channel = sensor_data["channel"]
             adc = sensor_data["adc"]
 
-            # ------------------------------------------------
-            # READ RAW ADC VALUE
-            # ------------------------------------------------
+            try:
 
-            raw_value = adc.value
+                # --------------------------------------------
+                # READ RAW ADC VALUE
+                # --------------------------------------------
 
-            # ------------------------------------------------
-            # READ ADC VOLTAGE
-            # ------------------------------------------------
+                raw_value = adc.value
 
-            adc_voltage = adc.voltage
+                # --------------------------------------------
+                # READ ADC VOLTAGE
+                # --------------------------------------------
 
-            # ------------------------------------------------
-            # CALCULATE CURRENT
-            # ------------------------------------------------
+                adc_voltage = adc.voltage
 
-            current_ma = voltage_to_current(
-                adc_voltage
-            )
+                # --------------------------------------------
+                # VOLTAGE → CURRENT
+                # --------------------------------------------
 
-            # ------------------------------------------------
-            # CALCULATE PRESSURE
-            # ------------------------------------------------
+                current_ma = voltage_to_current(
+                    adc_voltage
+                )
 
-            pressure_ideal = current_to_pressure(
-                current_ma
-            )
+                # --------------------------------------------
+                # CURRENT → PRESSURE
+                # --------------------------------------------
 
-            # ------------------------------------------------
-            # SAVE TO DATABASE
-            # ------------------------------------------------
+                pressure_ideal = current_to_pressure(
+                    current_ma
+                )
 
-            save_reading(
-                timestamp=timestamp,
-                sensor=sensor_name,
-                adc_channel=adc_channel,
-                raw_value=raw_value,
-                adc_voltage=adc_voltage,
-                current_ma=current_ma,
-                pressure_ideal=pressure_ideal
-            )
+                # --------------------------------------------
+                # SAVE TO DATABASE
+                # --------------------------------------------
 
-            # ------------------------------------------------
-            # DISPLAY
-            # ------------------------------------------------
+                save_reading(
+                    timestamp=timestamp,
+                    sensor=sensor_name,
+                    adc_channel=adc_channel,
+                    raw_value=raw_value,
+                    adc_voltage=adc_voltage,
+                    current_ma=current_ma,
+                    pressure_ideal=pressure_ideal
+                )
 
-            print(
-                f"{timestamp} | "
-                f"{sensor_name} | "
-                f"{adc_channel} | "
-                f"RAW={raw_value} | "
-                f"V={adc_voltage:.4f} V | "
-                f"I={current_ma:.3f} mA | "
-                f"P={pressure_ideal:.3f} bar"
-            )
+                # --------------------------------------------
+                # DISPLAY
+                # --------------------------------------------
+
+                print(
+                    f"{timestamp} | "
+                    f"{sensor_name:<3} | "
+                    f"{adc_channel} | "
+                    f"RAW={raw_value:6d} | "
+                    f"V={adc_voltage:.4f} V | "
+                    f"I={current_ma:.3f} mA | "
+                    f"P={pressure_ideal:.3f} bar"
+                )
+
+            except Exception as channel_error:
+
+                print(
+                    f"{timestamp} | "
+                    f"{sensor_name} | "
+                    f"{adc_channel} | "
+                    f"ERROR: {channel_error}"
+                )
 
         print("----------------------------------------------")
 
-        # Reading interval
+        # Read every 1 second
         time.sleep(1)
 
 
+# ============================================================
+# STOP PROGRAM
+# ============================================================
+
 except KeyboardInterrupt:
 
-    print("\nProgram stopped by user.")
+    print()
+    print("Program stopped by user.")
 
 
 except Exception as e:
 
-    print("\nERROR:", e)
+    print()
+    print("FATAL ERROR:", e)

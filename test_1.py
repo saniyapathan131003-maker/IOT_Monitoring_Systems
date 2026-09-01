@@ -1,6 +1,6 @@
 # Raspberry Pi – ADS1115 4-Channel Pressure Data Logger
 
-```python
+#python
 import os
 import time
 import sqlite3

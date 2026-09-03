@@ -269,22 +269,22 @@ try:
 
     BP_channel = AnalogIn(
         ads,
-        ADS.P0
+        0
     )
 
     FP_channel = AnalogIn(
         ads,
-        ADS.P1
+        1
     )
 
     CR_channel = AnalogIn(
         ads,
-        ADS.P2
+        2
     )
 
     BC_channel = AnalogIn(
         ads,
-        ADS.P3
+        3
     )
 
     print(

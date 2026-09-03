@@ -1,4 +1,4 @@
-```python
+
 #!/usr/bin/env python3
 
 import os
@@ -388,4 +388,3 @@ while True:
 
     # Small delay before checking SQLite again
     time.sleep(0.1)
-```

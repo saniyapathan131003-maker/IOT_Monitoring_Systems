@@ -1,59 +1,44 @@
 #!/usr/bin/env python3
 
-import time
-import sys
-import sqlite3
 import os
+import sys
+import time
+import sqlite3
+import serial
+import re
 import threading
 
-# ============================================================
-# OPTIONAL: SERIAL COMMUNICATION FOR EC200U
-# ============================================================
-try:
-    import serial
-    SERIAL_AVAILABLE = True
-except ImportError:
-    SERIAL_AVAILABLE = False
-
-# ---------------- ENCODING ----------------
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# Existing pressure capture settings
-RAW_THRESHOLD = 326
-READ_INTERVAL = 0.1
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH = os.path.join(
+    BASE_DIR,
+    "db",
+    "new_db.db"
+)
 
 # EC200U UART
 GSM_PORT = "/dev/ttyAMA3"
 GSM_BAUDRATE = 115200
-GSM_TIMEOUT = 3
 
-# GSM information refresh interval
-GSM_CHECK_INTERVAL = 60
+# Pressure capture
+RAW_THRESHOLD = 326
+READ_INTERVAL = 0.1
 
-# Cellular ping target
-# This measures cellular/network latency, not your cloud API latency.
-PING_HOST = "8.8.8.8"
+# GSM/GNSS refresh intervals
+GSM_REFRESH_INTERVAL = 30
+GNSS_REFRESH_INTERVAL = 5
 
-# ============================================================
-# DATABASE PATH
-# ============================================================
+# GNSS command timeout
+GNSS_TIMEOUT = 10
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DB_DIR = os.path.join(BASE_DIR, "db")
-os.makedirs(DB_DIR, exist_ok=True)
-
-DB_PATH = os.path.join(DB_DIR, "new_db.db")
 
 # ============================================================
-# DATABASE CONNECTION
+# DATABASE
 # ============================================================
 
 conn = sqlite3.connect(
@@ -65,13 +50,13 @@ conn.row_factory = sqlite3.Row
 
 cursor = conn.cursor()
 
+
 # ============================================================
-# CREATE SENSOR TABLE
+# CREATE TABLE
 # ============================================================
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS brake_pressure_log (
-
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     device_id TEXT,
@@ -83,117 +68,98 @@ CREATE TABLE IF NOT EXISTS brake_pressure_log (
 
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
 
-    uploaded INTEGER DEFAULT 0,
-
-    gsm_status TEXT,
-    sim_status TEXT,
-    sim_iccid TEXT,
-    mobile_number TEXT,
-
-    signal_strength INTEGER,
-    signal_dbm INTEGER,
-
-    network_status TEXT,
-    operator TEXT,
-
-    latency_ms INTEGER
-
+    uploaded INTEGER DEFAULT 0
 )
 """)
 
 conn.commit()
 
-# ============================================================
-# DATABASE MIGRATION
-# Add new columns if old table already exists
-# ============================================================
-
-existing_columns = set()
-
-cursor.execute("PRAGMA table_info(brake_pressure_log)")
-
-for column in cursor.fetchall():
-    existing_columns.add(column["name"])
-
-new_columns = {
-
-    "gsm_status": "TEXT",
-    "sim_status": "TEXT",
-    "sim_iccid": "TEXT",
-    "mobile_number": "TEXT",
-
-    "signal_strength": "INTEGER",
-    "signal_dbm": "INTEGER",
-
-    "network_status": "TEXT",
-    "operator": "TEXT",
-
-    "latency_ms": "INTEGER"
-}
-
-for column_name, column_type in new_columns.items():
-
-    if column_name not in existing_columns:
-
-        try:
-            cursor.execute(
-                f"ALTER TABLE brake_pressure_log "
-                f"ADD COLUMN {column_name} {column_type}"
-            )
-
-            print(
-                f"✅ Added database column: {column_name}",
-                flush=True
-            )
-
-        except Exception as e:
-
-            print(
-                f"⚠️ Could not add column {column_name}: {e}",
-                flush=True
-            )
-
-conn.commit()
 
 # ============================================================
-# FETCH DEVICE ID
+# ADD NEW COLUMNS SAFELY
 # ============================================================
 
-DEVICE_ID = "UNKNOWN"
-
-try:
+def add_column_if_missing(column_name, column_type):
 
     cursor.execute(
-        "SELECT device_id FROM device_config LIMIT 1"
+        "PRAGMA table_info(brake_pressure_log)"
     )
 
-    DEVICE_ROW = cursor.fetchone()
+    columns = [
+        row["name"]
+        for row in cursor.fetchall()
+    ]
 
-    if DEVICE_ROW and DEVICE_ROW["device_id"]:
+    if column_name not in columns:
 
-        DEVICE_ID = DEVICE_ROW["device_id"]
+        cursor.execute(
+            f"""
+            ALTER TABLE brake_pressure_log
+            ADD COLUMN {column_name} {column_type}
+            """
+        )
+
+        conn.commit()
 
         print(
-            f"✅ Device ID = {DEVICE_ID}\n",
+            f"✅ Added database column: {column_name}",
             flush=True
         )
 
-    else:
 
-        print(
-            "⚠️ Device ID missing! Using UNKNOWN.",
-            flush=True
-        )
+# GSM fields
+add_column_if_missing("gsm_status", "TEXT")
+add_column_if_missing("sim_status", "TEXT")
+add_column_if_missing("sim_iccid", "TEXT")
+add_column_if_missing("mobile_number", "TEXT")
+add_column_if_missing("signal_strength", "INTEGER")
+add_column_if_missing("signal_dbm", "INTEGER")
+add_column_if_missing("network_status", "TEXT")
+add_column_if_missing("operator", "TEXT")
+add_column_if_missing("latency_ms", "REAL")
 
-except Exception as e:
+# GNSS fields
+add_column_if_missing("gnss_status", "TEXT")
+add_column_if_missing("latitude", "REAL")
+add_column_if_missing("longitude", "REAL")
+add_column_if_missing("altitude_m", "REAL")
+add_column_if_missing("satellites", "INTEGER")
+add_column_if_missing("gps_utc", "TEXT")
+
+
+# ============================================================
+# DEVICE ID
+# ============================================================
+
+cursor.execute(
+    "SELECT device_id FROM device_config LIMIT 1"
+)
+
+device_row = cursor.fetchone()
+
+
+if device_row and device_row["device_id"]:
+
+    DEVICE_ID = device_row["device_id"]
+
+else:
+
+    DEVICE_ID = "UNKNOWN"
 
     print(
-        f"⚠️ Device ID could not be read: {e}",
+        "⚠️ Device ID missing!",
         flush=True
     )
 
+
+print(
+    f"✅ Device ID = {DEVICE_ID}",
+    flush=True
+)
+
+
 # ============================================================
-# ADS1115 SENSOR INITIALIZATION
+# ADS1115
 # ============================================================
 
 ADS_AVAILABLE = True
@@ -207,546 +173,92 @@ try:
 
     from adafruit_ads1x15.analog_in import AnalogIn
 
-    # I2C
+
     i2c = busio.I2C(
         board.SCL,
         board.SDA
     )
 
-    # ADS1115
+
     ads = ADS.ADS1115(i2c)
 
-    # Gain 1
     ads.gain = 1
 
-    # Channels
-    bp_channel = AnalogIn(ads, 0)
-    fp_channel = AnalogIn(ads, 1)
-    cr_channel = AnalogIn(ads, 2)
-    bc_channel = AnalogIn(ads, 3)
+
+    bp_channel = AnalogIn(
+        ads,
+        0
+    )
+
+    fp_channel = AnalogIn(
+        ads,
+        1
+    )
+
+    cr_channel = AnalogIn(
+        ads,
+        2
+    )
+
+    bc_channel = AnalogIn(
+        ads,
+        3
+    )
+
 
     print(
-        "✅ ADS1115 sensor detected and initialized.",
+        "✅ ADS1115 initialized",
         flush=True
     )
+
 
 except Exception as e:
 
     ADS_AVAILABLE = False
 
     print(
-        f"⚠️ ADS1115 sensor not detected! ({e})",
+        f"⚠️ ADS1115 unavailable: {e}",
         flush=True
     )
 
+
 # ============================================================
-# SENSOR READ FUNCTION
+# READ PRESSURE RAW VALUES
 # ============================================================
 
 def read_raw_values():
 
-    if ADS_AVAILABLE:
+    if not ADS_AVAILABLE:
 
         return (
-            bp_channel.value,
-            fp_channel.value,
-            cr_channel.value,
-            bc_channel.value
+            0,
+            0,
+            0,
+            0
         )
 
-    return (0, 0, 0, 0)
+
+    return (
+        bp_channel.value,
+        fp_channel.value,
+        cr_channel.value,
+        bc_channel.value
+    )
 
 
 # ============================================================
-# GSM CLASS
+# GSM VARIABLES
 # ============================================================
 
-class EC200U:
-
-    def __init__(self, port, baudrate, timeout):
-
-        self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-
-        self.ser = None
-
-        self.lock = threading.Lock()
-
-    # --------------------------------------------------------
-    # OPEN SERIAL PORT
-    # --------------------------------------------------------
-
-    def connect(self):
-
-        if not SERIAL_AVAILABLE:
-
-            print(
-                "⚠️ pyserial is not installed.",
-                flush=True
-            )
-
-            return False
-
-        try:
-
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=self.timeout,
-                write_timeout=self.timeout
-            )
-
-            time.sleep(1)
-
-            print(
-                f"📡 EC200U UART connected: {self.port}",
-                flush=True
-            )
-
-            return True
-
-        except Exception as e:
-
-            print(
-                f"⚠️ EC200U UART connection failed: {e}",
-                flush=True
-            )
-
-            self.ser = None
-
-            return False
-
-    # --------------------------------------------------------
-    # SEND AT COMMAND
-    # --------------------------------------------------------
-
-    def command(self, command, wait_time=1):
-
-        if self.ser is None:
-
-            return ""
-
-        with self.lock:
-
-            try:
-
-                # Clear old data
-                self.ser.reset_input_buffer()
-
-                # Send command
-                self.ser.write(
-                    (command + "\r\n").encode()
-                )
-
-                self.ser.flush()
-
-                time.sleep(wait_time)
-
-                response = self.ser.read_all().decode(
-                    errors="ignore"
-                )
-
-                return response.strip()
-
-            except Exception as e:
-
-                print(
-                    f"⚠️ GSM command error [{command}]: {e}",
-                    flush=True
-                )
-
-                return ""
-
-    # --------------------------------------------------------
-    # CHECK BASIC COMMUNICATION
-    # --------------------------------------------------------
-
-    def check_connection(self):
-
-        response = self.command(
-            "AT",
-            wait_time=0.5
-        )
-
-        return "OK" in response
-
-    # --------------------------------------------------------
-    # SIM STATUS
-    # --------------------------------------------------------
-
-    def get_sim_status(self):
-
-        response = self.command(
-            "AT+CPIN?",
-            wait_time=0.5
-        )
-
-        if "+CPIN: READY" in response:
-
-            return "READY"
-
-        if "+CPIN:" in response:
-
-            try:
-
-                line = [
-                    x for x in response.splitlines()
-                    if "+CPIN:" in x
-                ][0]
-
-                return line.split(":", 1)[1].strip()
-
-            except Exception:
-                return "UNKNOWN"
-
-        return "UNKNOWN"
-
-    # --------------------------------------------------------
-    # SIM ICCID
-    # --------------------------------------------------------
-
-    def get_iccid(self):
-
-        response = self.command(
-            "AT+QCCID",
-            wait_time=0.5
-        )
-
-        for line in response.splitlines():
-
-            line = line.strip()
-
-            if line.startswith("+QCCID:"):
-
-                return line.split(":", 1)[1].strip()
-
-        return ""
-
-    # --------------------------------------------------------
-    # MOBILE NUMBER
-    # --------------------------------------------------------
-
-    def get_mobile_number(self):
-
-        response = self.command(
-            "AT+CNUM",
-            wait_time=0.7
-        )
-
-        for line in response.splitlines():
-
-            line = line.strip()
-
-            if line.startswith("+CNUM:"):
-
-                try:
-
-                    data = line.split(":", 1)[1]
-
-                    parts = data.split(",")
-
-                    if len(parts) >= 2:
-
-                        number = parts[1].strip()
-
-                        number = number.replace(
-                            '"',
-                            ""
-                        )
-
-                        if number:
-                            return number
-
-                except Exception:
-                    pass
-
-        return ""
-
-    # --------------------------------------------------------
-    # SIGNAL STRENGTH
-    # --------------------------------------------------------
-
-    def get_signal(self):
-
-        response = self.command(
-            "AT+CSQ",
-            wait_time=0.5
-        )
-
-        for line in response.splitlines():
-
-            line = line.strip()
-
-            if line.startswith("+CSQ:"):
-
-                try:
-
-                    data = line.split(":", 1)[1]
-
-                    parts = data.split(",")
-
-                    csq = int(parts[0].strip())
-
-                    if csq == 99:
-
-                        return None, None
-
-                    # 3GPP approximate RSSI conversion
-                    dbm = -113 + (2 * csq)
-
-                    return csq, dbm
-
-                except Exception:
-                    pass
-
-        return None, None
-
-    # --------------------------------------------------------
-    # NETWORK REGISTRATION
-    # --------------------------------------------------------
-
-    def get_network_status(self):
-
-        response = self.command(
-            "AT+CREG?",
-            wait_time=0.5
-        )
-
-        for line in response.splitlines():
-
-            line = line.strip()
-
-            if line.startswith("+CREG:"):
-
-                try:
-
-                    data = line.split(":", 1)[1]
-
-                    parts = [
-                        x.strip()
-                        for x in data.split(",")
-                    ]
-
-                    status_code = parts[-1]
-
-                    status_map = {
-
-                        "0": "Not registered",
-                        "1": "Registered",
-                        "2": "Searching",
-                        "3": "Registration denied",
-                        "4": "Unknown",
-                        "5": "Registered roaming"
-                    }
-
-                    return status_map.get(
-                        status_code,
-                        f"Unknown ({status_code})"
-                    )
-
-                except Exception:
-                    pass
-
-        return "Unknown"
-
-    # --------------------------------------------------------
-    # OPERATOR
-    # --------------------------------------------------------
-
-    def get_operator(self):
-
-        response = self.command(
-            "AT+COPS?",
-            wait_time=1
-        )
-
-        for line in response.splitlines():
-
-            line = line.strip()
-
-            if line.startswith("+COPS:"):
-
-                try:
-
-                    data = line.split(":", 1)[1]
-
-                    parts = data.split(",")
-
-                    # Format:
-                    # +COPS: 0,0,"Jio",7
-
-                    if len(parts) >= 3:
-
-                        operator = parts[2].strip()
-
-                        operator = operator.replace(
-                            '"',
-                            ""
-                        )
-
-                        return operator
-
-                except Exception:
-                    pass
-
-        return ""
-
-    # --------------------------------------------------------
-    # CELLULAR PING LATENCY
-    # --------------------------------------------------------
-
-    def get_latency(self):
-
-        # EC200U QPING
-        command = (
-            f'AT+QPING=1,"{PING_HOST}",'
-            f'5,1'
-        )
-
-        response = self.command(
-            command,
-            wait_time=6
-        )
-
-        # Example:
-        # +QPING: 0,"8.8.8.8",32,45,64
-        #
-        # The 4th value is normally latency.
-
-        for line in response.splitlines():
-
-            line = line.strip()
-
-            if "+QPING:" in line:
-
-                try:
-
-                    data = line.split(":", 1)[1]
-
-                    parts = [
-                        x.strip()
-                        for x in data.split(",")
-                    ]
-
-                    if len(parts) >= 4:
-
-                        ping_time = parts[3]
-
-                        ping_time = ping_time.replace(
-                            '"',
-                            ""
-                        )
-
-                        return int(
-                            float(ping_time)
-                        )
-
-                except Exception:
-                    pass
-
-        return None
-
-    # --------------------------------------------------------
-    # COMPLETE GSM INFORMATION
-    # --------------------------------------------------------
-
-    def get_all_status(self):
-
-        status = {
-
-            "gsm_status": "Disconnected",
-
-            "sim_status": "UNKNOWN",
-
-            "sim_iccid": "",
-
-            "mobile_number": "",
-
-            "signal_strength": None,
-
-            "signal_dbm": None,
-
-            "network_status": "Unknown",
-
-            "operator": "",
-
-            "latency_ms": None
-        }
-
-        # Check modem
-        if not self.check_connection():
-
-            return status
-
-        status["gsm_status"] = "Connected"
-
-        # SIM
-        status["sim_status"] = self.get_sim_status()
-
-        # ICCID
-        if status["sim_status"] == "READY":
-
-            status["sim_iccid"] = self.get_iccid()
-
-            status["mobile_number"] = (
-                self.get_mobile_number()
-            )
-
-        # Signal
-        (
-            status["signal_strength"],
-            status["signal_dbm"]
-        ) = self.get_signal()
-
-        # Network
-        status["network_status"] = (
-            self.get_network_status()
-        )
-
-        # Operator
-        status["operator"] = (
-            self.get_operator()
-        )
-
-        # Latency
-        if (
-            status["network_status"]
-            in ["Registered", "Registered roaming"]
-        ):
-
-            status["latency_ms"] = (
-                self.get_latency()
-            )
-
-        return status
-
-
-# ============================================================
-# GSM INITIALIZATION
-# ============================================================
-
-gsm = EC200U(
-    GSM_PORT,
-    GSM_BAUDRATE,
-    GSM_TIMEOUT
-)
-
-gsm_connected = gsm.connect()
-
-# ============================================================
-# INITIAL GSM STATUS
-# ============================================================
-
-gsm_status_data = {
+gsm_data = {
 
     "gsm_status": "Disconnected",
 
-    "sim_status": "UNKNOWN",
+    "sim_status": "Unknown",
 
-    "sim_iccid": "",
+    "sim_iccid": None,
 
-    "mobile_number": "",
+    "mobile_number": None,
 
     "signal_strength": None,
 
@@ -754,291 +266,855 @@ gsm_status_data = {
 
     "network_status": "Unknown",
 
-    "operator": "",
+    "operator": None,
 
     "latency_ms": None
 }
 
-last_gsm_check = 0
 
 # ============================================================
-# DISPLAY INITIAL GSM STATUS
+# GNSS VARIABLES
 # ============================================================
 
-if gsm_connected:
+gnss_data = {
 
-    print(
-        "\n📡 Checking EC200U GSM status...",
-        flush=True
-    )
+    "gnss_status": "NO_FIX",
+
+    "latitude": None,
+
+    "longitude": None,
+
+    "altitude_m": None,
+
+    "satellites": None,
+
+    "gps_utc": None
+}
+
+
+# ============================================================
+# GSM SERIAL
+# ============================================================
+
+gsm_serial = None
+
+gsm_lock = threading.Lock()
+
+
+# ============================================================
+# OPEN EC200U
+# ============================================================
+
+def open_gsm():
+
+    global gsm_serial
 
     try:
 
-        gsm_status_data = gsm.get_all_status()
+        gsm_serial = serial.Serial(
+            GSM_PORT,
+            GSM_BAUDRATE,
+            timeout=2
+        )
+
+        time.sleep(1)
 
         print(
-            f"   GSM        : "
-            f"{gsm_status_data['gsm_status']}",
+            f"✅ EC200U opened on {GSM_PORT}",
             flush=True
         )
 
+        return True
+
+
+    except Exception as e:
+
+        gsm_serial = None
+
         print(
-            f"   SIM        : "
-            f"{gsm_status_data['sim_status']}",
+            f"❌ EC200U open failed: {e}",
             flush=True
         )
 
+        return False
+
+
+# ============================================================
+# SEND AT COMMAND
+# ============================================================
+
+def send_at(command, timeout=2):
+
+    global gsm_serial
+
+    if gsm_serial is None:
+
+        return ""
+
+
+    with gsm_lock:
+
+        try:
+
+            gsm_serial.reset_input_buffer()
+
+            gsm_serial.write(
+                (command + "\r\n").encode()
+            )
+
+            gsm_serial.flush()
+
+            start = time.time()
+
+            response = ""
+
+
+            while time.time() - start < timeout:
+
+                if gsm_serial.in_waiting:
+
+                    data = gsm_serial.read(
+                        gsm_serial.in_waiting
+                    )
+
+                    response += data.decode(
+                        errors="ignore"
+                    )
+
+
+                if "\r\nOK\r\n" in response:
+
+                    break
+
+
+                if "ERROR" in response:
+
+                    break
+
+
+                time.sleep(0.05)
+
+
+            print(
+                f"\n>>> {command}",
+                flush=True
+            )
+
+            print(
+                response.strip(),
+                flush=True
+            )
+
+
+            return response
+
+
+        except Exception as e:
+
+            print(
+                f"❌ AT command error: {e}",
+                flush=True
+            )
+
+            return ""
+
+
+# ============================================================
+# CHECK MODEM
+# ============================================================
+
+def check_modem():
+
+    response = send_at(
+        "AT",
+        2
+    )
+
+    return "OK" in response
+
+
+# ============================================================
+# SIM STATUS
+# ============================================================
+
+def get_sim_status():
+
+    response = send_at(
+        "AT+CPIN?",
+        2
+    )
+
+    if "+CPIN: READY" in response:
+
+        return "READY"
+
+    return "NOT_READY"
+
+
+# ============================================================
+# ICCID
+# ============================================================
+
+def get_iccid():
+
+    response = send_at(
+        "AT+QCCID",
+        3
+    )
+
+    match = re.search(
+        r"\+QCCID:\s*([0-9]+)",
+        response
+    )
+
+    if match:
+
+        return match.group(1)
+
+    return None
+
+
+# ============================================================
+# MOBILE NUMBER
+# ============================================================
+
+def get_mobile_number():
+
+    response = send_at(
+        "AT+CNUM",
+        3
+    )
+
+    # Example:
+    # +CNUM: "","+919XXXXXXXXX",145
+
+    match = re.search(
+        r'\+CNUM:\s*"[^"]*"\s*,\s*"([^"]+)"',
+        response
+    )
+
+    if match:
+
+        return match.group(1)
+
+    return None
+
+
+# ============================================================
+# SIGNAL
+# ============================================================
+
+def get_signal():
+
+    response = send_at(
+        "AT+CSQ",
+        2
+    )
+
+    match = re.search(
+        r"\+CSQ:\s*(\d+),(\d+)",
+        response
+    )
+
+    if not match:
+
+        return None, None
+
+
+    rssi = int(
+        match.group(1)
+    )
+
+
+    if rssi == 99:
+
+        return None, None
+
+
+    # 3GPP approximation
+    dbm = (
+        -113 + (2 * rssi)
+    )
+
+
+    return rssi, dbm
+
+
+# ============================================================
+# NETWORK REGISTRATION
+# ============================================================
+
+def get_network_status():
+
+    response = send_at(
+        "AT+CREG?",
+        2
+    )
+
+    match = re.search(
+        r"\+CREG:\s*\d+,\s*(\d+)",
+        response
+    )
+
+    if not match:
+
+        return "UNKNOWN"
+
+
+    status = match.group(1)
+
+
+    if status == "1":
+
+        return "REGISTERED_HOME"
+
+
+    if status == "5":
+
+        return "REGISTERED_ROAMING"
+
+
+    if status == "2":
+
+        return "SEARCHING"
+
+
+    if status == "0":
+
+        return "NOT_REGISTERED"
+
+
+    return "UNKNOWN"
+
+
+# ============================================================
+# OPERATOR
+# ============================================================
+
+def get_operator():
+
+    response = send_at(
+        "AT+COPS?",
+        5
+    )
+
+    match = re.search(
+        r'\+COPS:\s*\d+,\s*\d+,\s*"([^"]+)"',
+        response
+    )
+
+    if match:
+
+        return match.group(1)
+
+    return None
+
+
+# ============================================================
+# LATENCY
+# ============================================================
+
+def get_latency():
+
+    start = time.time()
+
+    response = send_at(
+        'AT+QPING=1,"8.8.8.8",5,1',
+        8
+    )
+
+    elapsed = (
+        time.time() - start
+    ) * 1000
+
+
+    match = re.search(
+        r"time[=:]\s*(\d+(?:\.\d+)?)",
+        response,
+        re.IGNORECASE
+    )
+
+    if match:
+
+        return float(
+            match.group(1)
+        )
+
+
+    if "OK" in response:
+
+        return round(
+            elapsed,
+            2
+        )
+
+
+    return None
+
+
+# ============================================================
+# START GNSS
+# ============================================================
+
+def start_gnss():
+
+    response = send_at(
+        "AT+QGPS=1",
+        5
+    )
+
+    if "OK" in response:
+
         print(
-            f"   ICCID      : "
-            f"{gsm_status_data['sim_iccid'] or 'Not available'}",
+            "🛰️ GNSS started",
             flush=True
         )
 
-        print(
-            f"   Mobile No. : "
-            f"{gsm_status_data['mobile_number'] or 'Not available'}",
-            flush=True
+        return True
+
+
+    # Already running can also be acceptable
+    if "CME ERROR: 504" in response:
+
+        return True
+
+
+    return False
+
+
+# ============================================================
+# GNSS LOCATION
+# ============================================================
+
+def get_gnss_location():
+
+    response = send_at(
+        "AT+QGPSLOC=0",
+        GNSS_TIMEOUT
+    )
+
+
+    match = re.search(
+        r"\+QGPSLOC:\s*"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+),"
+        r"([^,\r\n]+)",
+        response
+    )
+
+
+    if not match:
+
+        return None
+
+
+    fields = match.groups()
+
+
+    try:
+
+        utc_time = fields[0]
+
+        latitude_raw = fields[1]
+
+        longitude_raw = fields[2]
+
+        hdop = fields[3]
+
+        altitude = fields[4]
+
+        fix = fields[5]
+
+        satellites = fields[6]
+
+        # Some EC200U firmware versions may return
+        # fields differently. Keep the raw values safe.
+
+        latitude = convert_coordinate(
+            latitude_raw,
+            "lat"
         )
 
-        print(
-            f"   CSQ        : "
-            f"{gsm_status_data['signal_strength']}",
-            flush=True
+        longitude = convert_coordinate(
+            longitude_raw,
+            "lon"
         )
 
-        print(
-            f"   Signal     : "
-            f"{gsm_status_data['signal_dbm']} dBm",
-            flush=True
-        )
 
-        print(
-            f"   Network    : "
-            f"{gsm_status_data['network_status']}",
-            flush=True
-        )
+        if latitude is None or longitude is None:
 
-        print(
-            f"   Operator   : "
-            f"{gsm_status_data['operator'] or 'Unknown'}",
-            flush=True
-        )
+            return None
 
-        print(
-            f"   Latency    : "
-            f"{gsm_status_data['latency_ms']} ms\n",
-            flush=True
-        )
+
+        try:
+
+            altitude_value = float(
+                altitude
+            )
+
+        except:
+
+            altitude_value = None
+
+
+        try:
+
+            satellite_value = int(
+                satellites
+            )
+
+        except:
+
+            satellite_value = None
+
+
+        return {
+
+            "gnss_status": "FIX",
+
+            "latitude": latitude,
+
+            "longitude": longitude,
+
+            "altitude_m": altitude_value,
+
+            "satellites": satellite_value,
+
+            "gps_utc": utc_time
+        }
+
 
     except Exception as e:
 
         print(
-            f"⚠️ GSM status read failed: {e}",
+            f"⚠️ GNSS parsing error: {e}",
+            flush=True
+        )
+
+        return None
+
+
+# ============================================================
+# COORDINATE CONVERSION
+# ============================================================
+
+def convert_coordinate(value, coordinate_type):
+
+    if not value:
+
+        return None
+
+
+    value = value.strip()
+
+
+    # Example:
+    # 3150.7223N
+    # 11711.9293E
+
+    direction = value[-1]
+
+    number = value[:-1]
+
+
+    try:
+
+        decimal_minutes = float(
+            number
+        )
+
+    except:
+
+        return None
+
+
+    degrees_digits = 2
+
+    if coordinate_type == "lon":
+
+        degrees_digits = 3
+
+
+    degrees = int(
+        decimal_minutes /
+        100
+    )
+
+
+    minutes = (
+        decimal_minutes -
+        (degrees * 100)
+    )
+
+
+    decimal = (
+        degrees +
+        minutes / 60
+    )
+
+
+    if direction in ["S", "W"]:
+
+        decimal = -decimal
+
+
+    return round(
+        decimal,
+        7
+    )
+
+
+# ============================================================
+# GSM UPDATE
+# ============================================================
+
+def update_gsm_data():
+
+    global gsm_data
+
+
+    if not check_modem():
+
+        gsm_data["gsm_status"] = "Disconnected"
+
+        return
+
+
+    gsm_data["gsm_status"] = "Connected"
+
+
+    gsm_data["sim_status"] = get_sim_status()
+
+    gsm_data["sim_iccid"] = get_iccid()
+
+    gsm_data["mobile_number"] = get_mobile_number()
+
+    signal, dbm = get_signal()
+
+    gsm_data["signal_strength"] = signal
+
+    gsm_data["signal_dbm"] = dbm
+
+    gsm_data["network_status"] = get_network_status()
+
+    gsm_data["operator"] = get_operator()
+
+    gsm_data["latency_ms"] = get_latency()
+
+
+# ============================================================
+# GNSS UPDATE
+# ============================================================
+
+def update_gnss_data():
+
+    global gnss_data
+
+
+    location = get_gnss_location()
+
+
+    if location:
+
+        gnss_data.update(
+            location
+        )
+
+        print(
+            f"📍 GNSS: "
+            f"Lat={location['latitude']}, "
+            f"Lon={location['longitude']}, "
+            f"Alt={location['altitude_m']} m, "
+            f"Sat={location['satellites']}",
+            flush=True
+        )
+
+    else:
+
+        gnss_data["gnss_status"] = "NO_FIX"
+
+        print(
+            "🛰️ GNSS: No position fix",
             flush=True
         )
 
 
-last_gsm_check = time.time()
+# ============================================================
+# INITIALIZE EC200U
+# ============================================================
+
+gsm_available = open_gsm()
+
+
+if gsm_available:
+
+    # Check modem
+    if check_modem():
+
+        print(
+            "✅ EC200U responding",
+            flush=True
+        )
+
+        # Start GNSS
+        start_gnss()
+
+    else:
+
+        print(
+            "⚠️ EC200U not responding",
+            flush=True
+        )
+
 
 # ============================================================
-# MAIN CAPTURE LOOP
+# GSM/GNSS TIMERS
+# ============================================================
+
+last_gsm_update = 0
+
+last_gnss_update = 0
+
+
+# ============================================================
+# MAIN LOOP
 # ============================================================
 
 print(
-    "🚀 Capture system started...\n",
+    "\n🚀 Capture system started...\n",
     flush=True
 )
 
+
 last_raw = None
+
 
 try:
 
     while True:
 
-        # ====================================================
-        # GSM STATUS UPDATE
-        # ====================================================
-
         current_time = time.time()
 
+
+        # ====================================================
+        # GSM UPDATE
+        # ====================================================
+
         if (
-            current_time - last_gsm_check
-            >= GSM_CHECK_INTERVAL
+            gsm_available
+            and
+            current_time - last_gsm_update
+            >= GSM_REFRESH_INTERVAL
         ):
 
-            if gsm.ser is None:
+            try:
 
-                gsm.connect()
+                print(
+                    "\n📡 Updating GSM information...",
+                    flush=True
+                )
 
-            if gsm.ser is not None:
+                update_gsm_data()
 
-                try:
+            except Exception as e:
 
-                    gsm_status_data = (
-                        gsm.get_all_status()
-                    )
+                print(
+                    f"⚠️ GSM update error: {e}",
+                    flush=True
+                )
 
-                except Exception as e:
+            last_gsm_update = current_time
 
-                    print(
-                        f"⚠️ GSM status update failed: {e}",
-                        flush=True
-                    )
-
-            else:
-
-                gsm_status_data = {
-
-                    "gsm_status": "Disconnected",
-
-                    "sim_status": "UNKNOWN",
-
-                    "sim_iccid": "",
-
-                    "mobile_number": "",
-
-                    "signal_strength": None,
-
-                    "signal_dbm": None,
-
-                    "network_status": "Unknown",
-
-                    "operator": "",
-
-                    "latency_ms": None
-                }
-
-            print(
-                "\n📡 GSM STATUS UPDATE",
-                flush=True
-            )
-
-            print(
-                f"   GSM        : "
-                f"{gsm_status_data['gsm_status']}",
-                flush=True
-            )
-
-            print(
-                f"   SIM        : "
-                f"{gsm_status_data['sim_status']}",
-                flush=True
-            )
-
-            print(
-                f"   CSQ        : "
-                f"{gsm_status_data['signal_strength']}",
-                flush=True
-            )
-
-            print(
-                f"   Signal     : "
-                f"{gsm_status_data['signal_dbm']} dBm",
-                flush=True
-            )
-
-            print(
-                f"   Network    : "
-                f"{gsm_status_data['network_status']}",
-                flush=True
-            )
-
-            print(
-                f"   Operator   : "
-                f"{gsm_status_data['operator'] or 'Unknown'}",
-                flush=True
-            )
-
-            print(
-                f"   Latency    : "
-                f"{gsm_status_data['latency_ms']} ms\n",
-                flush=True
-            )
-
-            last_gsm_check = current_time
 
         # ====================================================
-        # ADS1115 READ
+        # GNSS UPDATE
         # ====================================================
 
-        if ADS_AVAILABLE:
+        if (
+            gsm_available
+            and
+            current_time - last_gnss_update
+            >= GNSS_REFRESH_INTERVAL
+        ):
 
-            current_raw = read_raw_values()
+            try:
 
-            ads_status = "Connected"
+                print(
+                    "\n🛰️ Updating GNSS location...",
+                    flush=True
+                )
 
-        else:
+                update_gnss_data()
 
-            current_raw = (
-                0,
-                0,
-                0,
-                0
-            )
+            except Exception as e:
 
-            ads_status = "Not connected"
+                print(
+                    f"⚠️ GNSS update error: {e}",
+                    flush=True
+                )
+
+            last_gnss_update = current_time
+
 
         # ====================================================
-        # TIMESTAMP
+        # PRESSURE READ
         # ====================================================
+
+        current_raw = read_raw_values()
+
 
         timestamp = time.strftime(
             "%Y-%m-%d %H:%M:%S"
         )
 
-        # ====================================================
-        # DISPLAY SENSOR DATA
-        # ====================================================
 
         print(
-
-            f"device_id = {DEVICE_ID}, "
-
-            f"BP_raw = {current_raw[0]}, "
-            f"FP_raw = {current_raw[1]}, "
-            f"CR_raw = {current_raw[2]}, "
-            f"BC_raw = {current_raw[3]}, "
-
-            f"timestamp = {timestamp}, "
-
-            f"ADS1115_status = {ads_status}, "
-
-            f"GSM = {gsm_status_data['gsm_status']}, "
-
-            f"SIM = {gsm_status_data['sim_status']}, "
-
-            f"CSQ = {gsm_status_data['signal_strength']}, "
-
-            f"Signal = {gsm_status_data['signal_dbm']} dBm, "
-
-            f"Network = {gsm_status_data['network_status']}, "
-
-            f"Latency = {gsm_status_data['latency_ms']} ms",
-
+            f"device_id={DEVICE_ID}, "
+            f"BP_raw={current_raw[0]}, "
+            f"FP_raw={current_raw[1]}, "
+            f"CR_raw={current_raw[2]}, "
+            f"BC_raw={current_raw[3]}, "
+            f"GSM={gsm_data['gsm_status']}, "
+            f"NET={gsm_data['network_status']}, "
+            f"GNSS={gnss_data['gnss_status']}, "
+            f"LAT={gnss_data['latitude']}, "
+            f"LON={gnss_data['longitude']}",
             flush=True
         )
 
+
         # ====================================================
-        # EXISTING RAW VALUE LOGIC
+        # UPLOAD DECISION
         # ====================================================
 
         upload = False
 
+
         if last_raw is None:
 
             upload = True
+
 
         else:
 
             diffs = [
 
                 abs(
-                    current_raw[i]
-                    - last_raw[i]
+                    current_raw[i] -
+                    last_raw[i]
                 )
 
                 for i in range(4)
             ]
+
 
             if any(
                 diff >= RAW_THRESHOLD
@@ -1047,186 +1123,153 @@ try:
 
                 upload = True
 
+
         # ====================================================
-        # INSERT INTO SQLITE
+        # INSERT DATABASE
         # ====================================================
 
         if upload:
 
-            try:
+            cursor.execute(
+                """
+                INSERT INTO brake_pressure_log
+                (
+                    device_id,
 
-                cursor.execute(
-                    """
-                    INSERT INTO brake_pressure_log
-                    (
-                        device_id,
+                    BP_raw,
+                    FP_raw,
+                    CR_raw,
+                    BC_raw,
 
-                        BP_raw,
-                        FP_raw,
-                        CR_raw,
-                        BC_raw,
+                    timestamp,
 
-                        timestamp,
+                    uploaded,
 
-                        uploaded,
+                    gsm_status,
+                    sim_status,
+                    sim_iccid,
+                    mobile_number,
 
-                        gsm_status,
-                        sim_status,
-                        sim_iccid,
-                        mobile_number,
+                    signal_strength,
+                    signal_dbm,
 
-                        signal_strength,
-                        signal_dbm,
+                    network_status,
+                    operator,
+                    latency_ms,
 
-                        network_status,
-                        operator,
-
-                        latency_ms
-                    )
-
-                    VALUES
-                    (
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        0,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?
-                    )
-                    """,
-
-                    (
-
-                        DEVICE_ID,
-
-                        current_raw[0],
-                        current_raw[1],
-                        current_raw[2],
-                        current_raw[3],
-
-                        timestamp,
-
-                        gsm_status_data[
-                            "gsm_status"
-                        ],
-
-                        gsm_status_data[
-                            "sim_status"
-                        ],
-
-                        gsm_status_data[
-                            "sim_iccid"
-                        ],
-
-                        gsm_status_data[
-                            "mobile_number"
-                        ],
-
-                        gsm_status_data[
-                            "signal_strength"
-                        ],
-
-                        gsm_status_data[
-                            "signal_dbm"
-                        ],
-
-                        gsm_status_data[
-                            "network_status"
-                        ],
-
-                        gsm_status_data[
-                            "operator"
-                        ],
-
-                        gsm_status_data[
-                            "latency_ms"
-                        ]
-                    )
+                    gnss_status,
+                    latitude,
+                    longitude,
+                    altitude_m,
+                    satellites,
+                    gps_utc
                 )
 
-                conn.commit()
+                VALUES
+                (
+                    ?, ?, ?, ?, ?,
+                    ?,
+                    0,
 
-                # Keep your existing logic:
-                # last_raw changes only after insertion
-                last_raw = current_raw
+                    ?, ?, ?, ?,
 
-                print(
-                    f"✅ Data inserted into DB at "
-                    f"{timestamp}",
-                    flush=True
+                    ?, ?,
+
+                    ?, ?, ?,
+
+                    ?, ?, ?, ?, ?, ?
                 )
+                """,
 
-                print(
-                    f"   GSM={gsm_status_data['gsm_status']} | "
-                    f"SIM={gsm_status_data['sim_status']} | "
-                    f"CSQ={gsm_status_data['signal_strength']} | "
-                    f"{gsm_status_data['signal_dbm']} dBm | "
-                    f"Network={gsm_status_data['network_status']} | "
-                    f"Latency={gsm_status_data['latency_ms']} ms",
-                    flush=True
+                (
+                    DEVICE_ID,
+
+                    current_raw[0],
+                    current_raw[1],
+                    current_raw[2],
+                    current_raw[3],
+
+                    timestamp,
+
+                    gsm_data["gsm_status"],
+                    gsm_data["sim_status"],
+                    gsm_data["sim_iccid"],
+                    gsm_data["mobile_number"],
+
+                    gsm_data["signal_strength"],
+                    gsm_data["signal_dbm"],
+
+                    gsm_data["network_status"],
+                    gsm_data["operator"],
+                    gsm_data["latency_ms"],
+
+                    gnss_data["gnss_status"],
+                    gnss_data["latitude"],
+                    gnss_data["longitude"],
+                    gnss_data["altitude_m"],
+                    gnss_data["satellites"],
+                    gnss_data["gps_utc"]
                 )
+            )
 
-            except Exception as e:
 
-                print(
-                    f"❌ Database insert failed: {e}",
-                    flush=True
-                )
+            conn.commit()
+
+
+            last_raw = current_raw
+
+
+            print(
+                f"✅ Data inserted into DB at {timestamp}",
+                flush=True
+            )
+
 
         else:
 
             print(
-                "⏭ No significant change → "
-                "Skipped insert\n",
+                "⏭ No significant pressure change → "
+                "Skipped insert",
                 flush=True
             )
 
-        # ====================================================
-        # SENSOR READ INTERVAL
-        # ====================================================
 
-        time.sleep(READ_INTERVAL)
+        time.sleep(
+            READ_INTERVAL
+        )
+
+
 except KeyboardInterrupt:
 
     print(
-        "\n🛑 Capture system stopped by user.",
+        "\n🛑 Capture stopped",
         flush=True
     )
+
 
 finally:
 
     try:
 
-        if gsm.ser is not None:
+        if gsm_serial:
 
-            gsm.ser.close()
+            gsm_serial.close()
 
-            print(
-                "📡 EC200U UART closed.",
-                flush=True
-            )
+    except:
 
-    except Exception:
         pass
+
 
     try:
 
         conn.close()
 
-        print(
-            "💾 Database connection closed.",
-            flush=True
-        )
+    except:
 
-    except Exception:
         pass
+
+
+    print(
+        "✅ Capture system closed",
+        flush=True
+    )

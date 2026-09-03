@@ -1,67 +1,68 @@
 #!/usr/bin/env python3
 
+import time
+import sys
+import sqlite3
 import os
 import re
-import time
-import sqlite3
-import threading
-from datetime import datetime
-
-import board
-import busio
 import serial
+import threading
 
-import adafruit_ads1x15.ads1115 as ADS
-from adafruit_ads1x15.analog_in import AnalogIn
+
+# ============================================================
+# ENCODING
+# ============================================================
+
+sys.stdout.reconfigure(encoding="utf-8")
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-DEVICE_ID = "Raspberry4_8"
+RAW_THRESHOLD = 326          # ~0.5 bar equivalent
+READ_INTERVAL = 0.1          # pressure sampling interval
 
-DB_PATH = "db/new_db.db"
+GSM_INTERVAL = 30            # GSM information refresh
+GNSS_INTERVAL = 5             # GNSS polling interval
 
-GSM_PORT = "/dev/ttyAMA3"
-GSM_BAUD = 115200
-
-RAW_THRESHOLD = 326
-
-READ_INTERVAL = 0.1
-GSM_INTERVAL = 30
-GNSS_INTERVAL = 5
+EC200U_PORT = "/dev/ttyAMA3"
+EC200U_BAUD = 115200
 
 MODEM_RETRY_INTERVAL = 5
 
-ADS_ADDRESS = 0x48
 
-# ------------------------------------------------------------
-# AWS / uploader will use uploaded field.
-# 0 = not uploaded
-# 1 = uploaded
-# ------------------------------------------------------------
+# ============================================================
+# DATABASE PATH
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH = os.path.join(
+    BASE_DIR,
+    "db",
+    "new_db.db"
+)
 
 
 # ============================================================
-# GLOBAL VARIABLES
+# GLOBAL EC200U
 # ============================================================
 
 gsm_serial = None
+
 gsm_lock = threading.Lock()
 
 gsm_connected = False
-gnss_enabled = False
 
-last_gsm_update = 0
-last_gnss_update = 0
+last_modem_retry = 0
 
-first_pressure_stored = False
-first_gnss_fix_stored = False
 
-last_raw = None
+# ============================================================
+# GSM INFORMATION
+# ============================================================
 
-latest_gsm = {
+gsm_info = {
     "gsm_status": "DISCONNECTED",
     "sim_status": None,
     "sim_iccid": None,
@@ -73,7 +74,12 @@ latest_gsm = {
     "latency_ms": None,
 }
 
-latest_gnss = {
+
+# ============================================================
+# GNSS INFORMATION
+# ============================================================
+
+gnss_info = {
     "gnss_status": "NO FIX",
     "latitude": None,
     "longitude": None,
@@ -84,33 +90,38 @@ latest_gnss = {
 
 
 # ============================================================
-# START MESSAGE
-# ============================================================
-
-print()
-print("=" * 75)
-print(f"✅ Device ID = {DEVICE_ID}")
-print("=" * 75)
-
-
-# ============================================================
-# DATABASE
+# DATABASE CONNECTION
 # ============================================================
 
 def get_db_connection():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-    conn = sqlite3.connect(
+    os.makedirs(
+        os.path.dirname(DB_PATH),
+        exist_ok=True
+    )
+
+    connection = sqlite3.connect(
         DB_PATH,
         timeout=30,
         check_same_thread=False
     )
 
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    connection.row_factory = sqlite3.Row
 
-    return conn
+    connection.execute(
+        "PRAGMA journal_mode=WAL"
+    )
 
+    connection.execute(
+        "PRAGMA busy_timeout=30000"
+    )
+
+    return connection
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
 
 def initialize_database():
 
@@ -119,7 +130,11 @@ def initialize_database():
     try:
 
         # ----------------------------------------------------
-        # Create base table if it does not exist
+        # Original pressure columns
+        # + GSM columns
+        # + GNSS columns
+        #
+        # TOTAL = 23 COLUMNS
         # ----------------------------------------------------
 
         conn.execute("""
@@ -134,7 +149,7 @@ def initialize_database():
                 CR_raw INTEGER,
                 BC_raw INTEGER,
 
-                timestamp TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
 
                 uploaded INTEGER DEFAULT 0,
 
@@ -158,18 +173,36 @@ def initialize_database():
         """)
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        # Existing DB may have older schema.
-        # Add missing columns automatically.
+        # CHECK EXISTING DATABASE COLUMNS
+        # ----------------------------------------------------
+
+        existing_columns = set()
+
+        rows = conn.execute(
+            "PRAGMA table_info(brake_pressure_log)"
+        ).fetchall()
+
+        for row in rows:
+
+            existing_columns.add(
+                row["name"]
+            )
+
+        # ----------------------------------------------------
+        # ADD MISSING COLUMNS
         # ----------------------------------------------------
 
         required_columns = {
+
             "device_id": "TEXT",
+
             "BP_raw": "INTEGER",
             "FP_raw": "INTEGER",
             "CR_raw": "INTEGER",
             "BC_raw": "INTEGER",
-            "timestamp": "TEXT",
+
+            "timestamp": "DATETIME",
+
             "uploaded": "INTEGER DEFAULT 0",
 
             "gsm_status": "TEXT",
@@ -187,335 +220,187 @@ def initialize_database():
             "longitude": "REAL",
             "altitude_m": "REAL",
             "satellites": "INTEGER",
-            "gps_utc": "TEXT",
+            "gps_utc": "TEXT"
         }
-
-        existing = set()
-
-        rows = conn.execute(
-            "PRAGMA table_info(brake_pressure_log)"
-        ).fetchall()
-
-        for row in rows:
-            existing.add(row[1])
 
         for column, datatype in required_columns.items():
 
-            if column not in existing:
+            if column not in existing_columns:
 
-                print(f"🛠 Adding missing DB column: {column}")
+                print(
+                    f"🛠 Adding DB column: {column}",
+                    flush=True
+                )
 
                 conn.execute(
-                    f"ALTER TABLE brake_pressure_log "
-                    f"ADD COLUMN {column} {datatype}"
+                    f"""
+                    ALTER TABLE brake_pressure_log
+                    ADD COLUMN {column} {datatype}
+                    """
                 )
 
         conn.commit()
 
-        print("✅ SQLite database initialized")
-
-    except Exception as e:
-
-        print("❌ DATABASE INITIALIZATION FAILED")
-        print(f"Error: {e}")
-
-        raise
-
     finally:
+
         conn.close()
 
 
 # ============================================================
-# DATABASE INSERT
+# FETCH DEVICE ID
 # ============================================================
 
-def insert_database_record(
-    bp,
-    fp,
-    cr,
-    bc,
-    record_type="PRESSURE"
-):
+def get_device_id():
 
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    # --------------------------------------------------------
-    # Build values using dictionary.
-    # This prevents column/value count mismatch.
-    # --------------------------------------------------------
-
-    data = {
-
-        "device_id": DEVICE_ID,
-
-        "BP_raw": int(bp),
-        "FP_raw": int(fp),
-        "CR_raw": int(cr),
-        "BC_raw": int(bc),
-
-        "timestamp": timestamp,
-
-        "uploaded": 0,
-
-        "gsm_status": latest_gsm["gsm_status"],
-        "sim_status": latest_gsm["sim_status"],
-        "sim_iccid": latest_gsm["sim_iccid"],
-        "mobile_number": latest_gsm["mobile_number"],
-        "signal_strength": latest_gsm["signal_strength"],
-        "signal_dbm": latest_gsm["signal_dbm"],
-        "network_status": latest_gsm["network_status"],
-        "operator": latest_gsm["operator"],
-        "latency_ms": latest_gsm["latency_ms"],
-
-        "gnss_status": latest_gnss["gnss_status"],
-        "latitude": latest_gnss["latitude"],
-        "longitude": latest_gnss["longitude"],
-        "altitude_m": latest_gnss["altitude_m"],
-        "satellites": latest_gnss["satellites"],
-        "gps_utc": latest_gnss["gps_utc"],
-    }
-
-    conn = None
+    conn = get_db_connection()
 
     try:
 
-        conn = get_db_connection()
+        cursor = conn.cursor()
 
-        columns = list(data.keys())
-
-        placeholders = ",".join(
-            ["?"] * len(columns)
+        cursor.execute(
+            "SELECT device_id FROM device_config LIMIT 1"
         )
 
-        sql = f"""
-            INSERT INTO brake_pressure_log
-            ({",".join(columns)})
-            VALUES
-            ({placeholders})
-        """
+        row = cursor.fetchone()
 
-        values = [data[column] for column in columns]
+        if row and row["device_id"]:
 
-        cursor = conn.execute(sql, values)
+            return row["device_id"]
 
-        conn.commit()
-
-        db_id = cursor.lastrowid
-
-        if record_type == "GNSS":
-
-            print()
-            print("🛰️📥 FIRST GNSS FIX STORED")
-            print(f"   DB ID       : {db_id}")
-            print(
-                f"   Latitude    : "
-                f"{latest_gnss['latitude']}"
-            )
-            print(
-                f"   Longitude   : "
-                f"{latest_gnss['longitude']}"
-            )
-            print(
-                f"   Altitude    : "
-                f"{latest_gnss['altitude_m']} m"
-            )
-            print(
-                f"   Satellites  : "
-                f"{latest_gnss['satellites']}"
-            )
-
-        else:
-
-            print()
-            print("💾 PRESSURE RECORD STORED")
-            print(f"   DB ID : {db_id}")
-            print(f"   BP    : {bp}")
-            print(f"   FP    : {fp}")
-            print(f"   CR    : {cr}")
-            print(f"   BC    : {bc}")
-
-        return True
+        return "UNKNOWN"
 
     except Exception as e:
 
-        print()
-        print("❌ DATABASE INSERT FAILED")
-        print(f"Error: {e}")
+        print(
+            f"⚠️ Device ID read error: {e}",
+            flush=True
+        )
 
-        return False
+        return "UNKNOWN"
 
     finally:
 
-        if conn:
-            conn.close()
+        conn.close()
+
+
+# ============================================================
+# DEVICE ID
+# ============================================================
+
+DEVICE_ID = get_device_id()
+
+print()
+print("=" * 75)
+print(
+    f"✅ Device ID = {DEVICE_ID}",
+    flush=True
+)
+print("=" * 75)
 
 
 # ============================================================
 # ADS1115
 # ============================================================
 
-ads = None
+ADS_AVAILABLE = True
 
-BP_channel = None
-FP_channel = None
-CR_channel = None
-BC_channel = None
+try:
 
+    import board
+    import busio
+    import adafruit_ads1x15.ads1115 as ADS
+    from adafruit_ads1x15.analog_in import AnalogIn
 
-def initialize_ads():
+    i2c = busio.I2C(
+        board.SCL,
+        board.SDA
+    )
 
-    global ads
-    global BP_channel
-    global FP_channel
-    global CR_channel
-    global BC_channel
+    ads = ADS.ADS1115(i2c)
 
-    try:
+    ads.gain = 1
 
-        i2c = busio.I2C(
-            board.SCL,
-            board.SDA
-        )
+    # IMPORTANT:
+    # Your installed library works with numeric channels.
+    bp_channel = AnalogIn(ads, 0)
+    fp_channel = AnalogIn(ads, 1)
+    cr_channel = AnalogIn(ads, 2)
+    bc_channel = AnalogIn(ads, 3)
 
-        ads = ADS.ADS1115(
-            i2c,
-            address=ADS_ADDRESS
-        )
+    print(
+        "✅ ADS1115 initialized",
+        flush=True
+    )
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Your installed library does NOT expose ADS.P0.
-        # Numeric channels 0,1,2,3 work with your version.
-        # ----------------------------------------------------
+except Exception as e:
 
-        BP_channel = AnalogIn(ads, 0)
-        FP_channel = AnalogIn(ads, 1)
-        CR_channel = AnalogIn(ads, 2)
-        BC_channel = AnalogIn(ads, 3)
+    ADS_AVAILABLE = False
 
-        print("✅ ADS1115 initialized")
+    print(
+        "❌ ADS1115 initialization failed",
+        flush=True
+    )
 
-        return True
-
-    except Exception as e:
-
-        print("❌ ADS1115 initialization failed")
-        print(f"Error: {e}")
-
-        return False
+    print(
+        f"Error: {e}",
+        flush=True
+    )
 
 
-def read_pressure():
+# ============================================================
+# READ ADS1115
+# ============================================================
 
-    try:
+def read_raw_values():
 
-        bp = BP_channel.value
-        fp = FP_channel.value
-        cr = CR_channel.value
-        bc = BC_channel.value
+    if not ADS_AVAILABLE:
 
         return (
-            int(bp),
-            int(fp),
-            int(cr),
-            int(bc)
+            0,
+            0,
+            0,
+            0
+        )
+
+    try:
+
+        return (
+            int(bp_channel.value),
+            int(fp_channel.value),
+            int(cr_channel.value),
+            int(bc_channel.value)
         )
 
     except Exception as e:
 
-        print(f"❌ ADS1115 read error: {e}")
+        print(
+            f"⚠️ ADS1115 read error: {e}",
+            flush=True
+        )
 
-        return None
+        return (
+            0,
+            0,
+            0,
+            0
+        )
 
 
 # ============================================================
-# EC200U UART
+# EC200U SEND AT COMMAND
 # ============================================================
 
-def close_gsm():
+def send_at(
+    command,
+    timeout=3
+):
 
     global gsm_serial
     global gsm_connected
-    global gnss_enabled
-
-    try:
-
-        if gsm_serial:
-
-            gsm_serial.close()
-
-    except Exception:
-        pass
-
-    gsm_serial = None
-    gsm_connected = False
-    gnss_enabled = False
-
-    latest_gsm["gsm_status"] = "DISCONNECTED"
-
-
-def open_gsm():
-
-    global gsm_serial
-    global gsm_connected
-
-    try:
-
-        gsm_serial = serial.Serial(
-            GSM_PORT,
-            GSM_BAUD,
-            timeout=2,
-            write_timeout=2
-        )
-
-        time.sleep(1)
-
-        print()
-        print(
-            f"🔌 EC200U UART opened: "
-            f"{GSM_PORT}"
-        )
-
-        response = send_at(
-            "AT",
-            timeout=3,
-            show=False
-        )
-
-        if "OK" in response:
-
-            gsm_connected = True
-
-            latest_gsm["gsm_status"] = "Connected"
-
-            print("✅ EC200U responding")
-
-            return True
-
-        print("❌ EC200U not responding")
-
-        close_gsm()
-
-        return False
-
-    except Exception as e:
-
-        print(
-            f"❌ EC200U UART open failed: {e}"
-        )
-
-        close_gsm()
-
-        return False
-
-
-def send_at(command, timeout=3, show=False):
-
-    global gsm_serial
 
     if gsm_serial is None:
+
         return ""
 
     try:
@@ -530,102 +415,236 @@ def send_at(command, timeout=3, show=False):
 
             gsm_serial.flush()
 
-            start = time.time()
-
             response = ""
 
+            start_time = time.time()
+
             while (
-                time.time() - start
-            ) < timeout:
+                time.time() - start_time
+                < timeout
+            ):
 
                 if gsm_serial.in_waiting:
 
                     data = gsm_serial.read(
                         gsm_serial.in_waiting
-                    ).decode(
-                        errors="ignore"
                     )
 
-                    response += data
+                    response += data.decode(
+                        errors="ignore"
+                    )
 
                     if (
                         "\r\nOK\r\n" in response
                         or "\r\nERROR\r\n" in response
                     ):
+
                         break
 
                 time.sleep(0.05)
-
-            if show:
-
-                print(f">>> {command}")
-                print(response.strip())
 
             return response
 
     except Exception as e:
 
         print(
-            f"❌ UART error for {command}: {e}"
+            f"⚠️ EC200U UART error: {e}",
+            flush=True
         )
 
-        close_gsm()
+        gsm_connected = False
 
         return ""
 
 
-def ensure_modem():
+# ============================================================
+# OPEN EC200U
+# ============================================================
+
+def open_ec200u():
+
+    global gsm_serial
+    global gsm_connected
+
+    try:
+
+        if gsm_serial is not None:
+
+            try:
+                gsm_serial.close()
+            except Exception:
+                pass
+
+            gsm_serial = None
+
+        gsm_serial = serial.Serial(
+            EC200U_PORT,
+            EC200U_BAUD,
+            timeout=2,
+            write_timeout=2
+        )
+
+        time.sleep(1)
+
+        print()
+        print(
+            f"🔌 EC200U UART opened: "
+            f"{EC200U_PORT}",
+            flush=True
+        )
+
+        response = send_at(
+            "AT",
+            timeout=3
+        )
+
+        if "OK" in response:
+
+            gsm_connected = True
+
+            gsm_info[
+                "gsm_status"
+            ] = "Connected"
+
+            print(
+                "✅ EC200U responding",
+                flush=True
+            )
+
+            return True
+
+        print(
+            "❌ EC200U not responding",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ EC200U connection failed: {e}",
+            flush=True
+        )
+
+    gsm_connected = False
+
+    gsm_info[
+        "gsm_status"
+    ] = "DISCONNECTED"
+
+    return False
+
+
+# ============================================================
+# CLOSE EC200U
+# ============================================================
+
+def close_ec200u():
+
+    global gsm_serial
+    global gsm_connected
+
+    try:
+
+        if gsm_serial is not None:
+
+            gsm_serial.close()
+
+    except Exception:
+        pass
+
+    gsm_serial = None
+
+    gsm_connected = False
+
+    gsm_info[
+        "gsm_status"
+    ] = "DISCONNECTED"
+
+
+# ============================================================
+# CHECK EC200U
+# ============================================================
+
+def check_ec200u():
 
     global gsm_connected
 
     if gsm_serial is None:
 
-        return open_gsm()
+        return False
 
     response = send_at(
         "AT",
-        timeout=2,
-        show=False
+        timeout=2
     )
 
     if "OK" in response:
 
         gsm_connected = True
-        latest_gsm["gsm_status"] = "Connected"
+
+        gsm_info[
+            "gsm_status"
+        ] = "Connected"
 
         return True
 
-    print()
-    print("⚠️ EC200U not responding")
-    print("🔄 Starting automatic recovery...")
+    gsm_connected = False
 
-    close_gsm()
-
-    time.sleep(
-        MODEM_RETRY_INTERVAL
-    )
-
-    return open_gsm()
+    return False
 
 
 # ============================================================
-# GSM INFORMATION
+# ENSURE EC200U CONNECTION
+# ============================================================
+
+def ensure_ec200u():
+
+    global last_modem_retry
+
+    if check_ec200u():
+
+        return True
+
+    now = time.time()
+
+    if (
+        now - last_modem_retry
+        < MODEM_RETRY_INTERVAL
+    ):
+
+        return False
+
+    last_modem_retry = now
+
+    print()
+    print(
+        "⚠️ EC200U disconnected",
+        flush=True
+    )
+
+    print(
+        "🔄 Trying automatic EC200U reconnect...",
+        flush=True
+    )
+
+    close_ec200u()
+
+    return open_ec200u()
+
+
+# ============================================================
+# UPDATE GSM INFORMATION
 # ============================================================
 
 def update_gsm_information():
 
-    if not ensure_modem():
+    if not ensure_ec200u():
 
-        latest_gsm["gsm_status"] = "DISCONNECTED"
-
-        print()
-        print("📡 GSM INFORMATION")
-        print("   GSM Status    : DISCONNECTED")
+        gsm_info[
+            "gsm_status"
+        ] = "DISCONNECTED"
 
         return
-
-    print()
-    print("📡 Updating GSM information...")
 
     # --------------------------------------------------------
     # SIM
@@ -638,31 +657,35 @@ def update_gsm_information():
 
     if "READY" in cpin:
 
-        latest_gsm["sim_status"] = "READY"
+        gsm_info[
+            "sim_status"
+        ] = "READY"
 
     else:
 
-        latest_gsm["sim_status"] = "NOT READY"
+        gsm_info[
+            "sim_status"
+        ] = "NOT READY"
 
     # --------------------------------------------------------
     # ICCID
     # --------------------------------------------------------
 
-    iccid = send_at(
+    qccid = send_at(
         "AT+QCCID",
         timeout=3
     )
 
     match = re.search(
         r"\+QCCID:\s*([0-9]+)",
-        iccid
+        qccid
     )
 
     if match:
 
-        latest_gsm["sim_iccid"] = (
-            match.group(1)
-        )
+        gsm_info[
+            "sim_iccid"
+        ] = match.group(1)
 
     # --------------------------------------------------------
     # MOBILE NUMBER
@@ -680,9 +703,9 @@ def update_gsm_information():
 
     if match:
 
-        latest_gsm["mobile_number"] = (
-            match.group(1)
-        )
+        gsm_info[
+            "mobile_number"
+        ] = match.group(1)
 
     # --------------------------------------------------------
     # SIGNAL
@@ -700,22 +723,30 @@ def update_gsm_information():
 
     if match:
 
-        rssi = int(match.group(1))
+        rssi = int(
+            match.group(1)
+        )
 
-        latest_gsm["signal_strength"] = rssi
+        gsm_info[
+            "signal_strength"
+        ] = rssi
 
-        if rssi <= 31:
+        if 0 <= rssi <= 31:
 
-            latest_gsm["signal_dbm"] = (
-                -113 + (2 * rssi)
+            gsm_info[
+                "signal_dbm"
+            ] = -113 + (
+                2 * rssi
             )
 
         else:
 
-            latest_gsm["signal_dbm"] = None
+            gsm_info[
+                "signal_dbm"
+            ] = None
 
     # --------------------------------------------------------
-    # NETWORK REGISTRATION
+    # NETWORK
     # --------------------------------------------------------
 
     creg = send_at(
@@ -730,19 +761,24 @@ def update_gsm_information():
 
     if match:
 
-        status = int(match.group(1))
+        registration = int(
+            match.group(1)
+        )
 
-        if status in (1, 5):
+        if registration in (
+            1,
+            5
+        ):
 
-            latest_gsm["network_status"] = (
-                "REGISTERED"
-            )
+            gsm_info[
+                "network_status"
+            ] = "REGISTERED"
 
         else:
 
-            latest_gsm["network_status"] = (
-                "NOT REGISTERED"
-            )
+            gsm_info[
+                "network_status"
+            ] = "NOT REGISTERED"
 
     # --------------------------------------------------------
     # OPERATOR
@@ -760,101 +796,133 @@ def update_gsm_information():
 
     if match:
 
-        latest_gsm["operator"] = (
-            match.group(1)
-        )
+        gsm_info[
+            "operator"
+        ] = match.group(1)
 
     # --------------------------------------------------------
-    # PING / LATENCY
+    # LATENCY
     # --------------------------------------------------------
 
-    ping_start = time.time()
-
-    ping = send_at(
+    ping_response = send_at(
         'AT+QPING=1,"8.8.8.8",5,1',
-        timeout=8
+        timeout=10
     )
+
+    # Examples can contain:
+    # time=8.01 ms
+    # time=8.01
+    # time: 8.01
 
     match = re.search(
         r"time[=:]\s*([0-9.]+)",
-        ping,
+        ping_response,
         re.IGNORECASE
     )
 
     if match:
 
-        latest_gsm["latency_ms"] = float(
+        gsm_info[
+            "latency_ms"
+        ] = float(
             match.group(1)
-        )
-
-    elif "OK" in ping:
-
-        latest_gsm["latency_ms"] = round(
-            (time.time() - ping_start) * 1000,
-            2
         )
 
     else:
 
-        latest_gsm["latency_ms"] = None
+        gsm_info[
+            "latency_ms"
+        ] = None
 
-    latest_gsm["gsm_status"] = "Connected"
+    gsm_info[
+        "gsm_status"
+    ] = "Connected"
 
-    # --------------------------------------------------------
-    # PRINT GSM
-    # --------------------------------------------------------
+
+# ============================================================
+# PRINT GSM INFORMATION
+# ONLY CALLED ONCE AT STARTUP
+# ============================================================
+
+def print_gsm_information():
 
     print()
     print("📡 GSM INFORMATION")
+
     print(
         f"   GSM Status    : "
-        f"{latest_gsm['gsm_status']}"
+        f"{gsm_info['gsm_status']}"
     )
+
     print(
         f"   SIM Status    : "
-        f"{latest_gsm['sim_status']}"
+        f"{gsm_info['sim_status']}"
     )
+
     print(
         f"   ICCID         : "
-        f"{latest_gsm['sim_iccid']}"
+        f"{gsm_info['sim_iccid']}"
     )
+
     print(
         f"   Mobile Number : "
-        f"{latest_gsm['mobile_number']}"
+        f"{gsm_info['mobile_number']}"
     )
+
     print(
         f"   Signal RSSI   : "
-        f"{latest_gsm['signal_strength']}"
+        f"{gsm_info['signal_strength']}"
     )
+
     print(
         f"   Signal dBm    : "
-        f"{latest_gsm['signal_dbm']}"
+        f"{gsm_info['signal_dbm']}"
     )
+
     print(
         f"   Network       : "
-        f"{latest_gsm['network_status']}"
+        f"{gsm_info['network_status']}"
     )
+
     print(
         f"   Operator      : "
-        f"{latest_gsm['operator']}"
+        f"{gsm_info['operator']}"
     )
+
     print(
         f"   Latency       : "
-        f"{latest_gsm['latency_ms']} ms"
+        f"{gsm_info['latency_ms']} ms"
     )
 
 
 # ============================================================
-# GNSS
+# START / CHECK GNSS
 # ============================================================
 
 def start_gnss():
 
-    global gnss_enabled
-
-    if not ensure_modem():
+    if not ensure_ec200u():
 
         return False
+
+    status = send_at(
+        "AT+QGPS?",
+        timeout=3
+    )
+
+    if "+QGPS: 1" in status:
+
+        print(
+            "🛰️✅ GNSS already enabled",
+            flush=True
+        )
+
+        return True
+
+    print(
+        "🛰️ Starting GNSS...",
+        flush=True
+    )
 
     response = send_at(
         "AT+QGPS=1",
@@ -863,15 +931,14 @@ def start_gnss():
 
     if "OK" in response:
 
-        gnss_enabled = True
-
-        print("🛰️ GNSS enabled")
+        print(
+            "🛰️✅ GNSS enabled",
+            flush=True
+        )
 
         return True
 
-    # Already enabled may return ERROR.
-    # Check actual status.
-
+    # Check once again
     status = send_at(
         "AT+QGPS?",
         timeout=3
@@ -879,75 +946,57 @@ def start_gnss():
 
     if "+QGPS: 1" in status:
 
-        gnss_enabled = True
-
-        print("🛰️✅ GNSS already enabled")
+        print(
+            "🛰️✅ GNSS already enabled",
+            flush=True
+        )
 
         return True
 
-    gnss_enabled = False
-
-    print("❌ Could not enable GNSS")
+    print(
+        "❌ GNSS could not be enabled",
+        flush=True
+    )
 
     return False
 
 
-def ensure_gnss():
-
-    global gnss_enabled
-
-    if not ensure_modem():
-
-        return False
-
-    status = send_at(
-        "AT+QGPS?",
-        timeout=3
-    )
-
-    if "+QGPS: 1" in status:
-
-        gnss_enabled = True
-
-        return True
-
-    print()
-    print("⚠️ GNSS disabled")
-    print("🔄 Restarting GNSS...")
-
-    return start_gnss()
-
+# ============================================================
+# SATELLITE COUNT
+# ============================================================
 
 def get_satellite_count():
 
-    """
-    Try to obtain satellites from GGA NMEA.
-    """
+    if not ensure_ec200u():
+
+        return None
 
     response = send_at(
         'AT+QGPSGNMEA="GGA"',
         timeout=3
     )
 
-    # Example:
-    # $GNGGA,...,11,....
-
     for line in response.splitlines():
 
+        line = line.strip()
+
         if (
-            "$GNGGA" in line
-            or "$GPGGA" in line
+            line.startswith("$GPGGA")
+            or line.startswith("$GNGGA")
         ):
 
-            parts = line.strip().split(",")
+            fields = line.split(",")
 
             try:
 
-                # GGA satellite field
-                # Index 7
-                if len(parts) > 7:
+                # GGA:
+                # index 7 = satellites
 
-                    return int(parts[7])
+                if len(fields) > 7:
+
+                    return int(
+                        fields[7]
+                    )
 
             except Exception:
                 pass
@@ -955,13 +1004,52 @@ def get_satellite_count():
     return None
 
 
-def get_gnss_location():
+# ============================================================
+# READ GNSS
+# ============================================================
 
-    global latest_gnss
+def read_gnss():
 
-    if not ensure_gnss():
+    if not ensure_ec200u():
+
+        gnss_info[
+            "gnss_status"
+        ] = "NO FIX"
 
         return False
+
+    # --------------------------------------------------------
+    # Make sure GNSS is enabled
+    # --------------------------------------------------------
+
+    status = send_at(
+        "AT+QGPS?",
+        timeout=3
+    )
+
+    if "+QGPS: 1" not in status:
+
+        print(
+            "⚠️ GNSS disabled",
+            flush=True
+        )
+
+        print(
+            "🔄 Restarting GNSS...",
+            flush=True
+        )
+
+        if not start_gnss():
+
+            gnss_info[
+                "gnss_status"
+            ] = "NO FIX"
+
+            return False
+
+    # --------------------------------------------------------
+    # Get GPS location
+    # --------------------------------------------------------
 
     response = send_at(
         "AT+QGPSLOC=0",
@@ -975,319 +1063,413 @@ def get_gnss_location():
 
     if not match:
 
-        latest_gnss["gnss_status"] = "NO FIX"
+        gnss_info[
+            "gnss_status"
+        ] = "NO FIX"
 
         return False
 
     values = [
-        x.strip()
-        for x in match.group(1).split(",")
+        value.strip()
+        for value in
+        match.group(1).split(",")
     ]
 
     try:
 
-        # Quectel QGPSLOC format:
-        #
-        # UTC,
-        # latitude,
-        # longitude,
-        # HDOP,
-        # altitude,
-        # fix,
-        # course,
-        # speed,
-        # date,
-        # ...
-        #
-        # The exact trailing fields can vary.
-
         if len(values) < 5:
 
-            latest_gnss["gnss_status"] = "NO FIX"
+            gnss_info[
+                "gnss_status"
+            ] = "NO FIX"
 
             return False
 
         gps_utc = values[0]
 
-        latitude = float(values[1])
-        longitude = float(values[2])
-        altitude = float(values[4])
+        latitude = float(
+            values[1]
+        )
 
-        # 0 usually means invalid/no fix.
-        # Valid QGPSLOC normally contains coordinates.
+        longitude = float(
+            values[2]
+        )
+
+        altitude = float(
+            values[4]
+        )
+
+        # ----------------------------------------------------
+        # Invalid coordinates
+        # ----------------------------------------------------
 
         if (
             abs(latitude) < 0.000001
             and abs(longitude) < 0.000001
         ):
 
-            latest_gnss["gnss_status"] = "NO FIX"
+            gnss_info[
+                "gnss_status"
+            ] = "NO FIX"
 
             return False
 
         satellites = get_satellite_count()
 
-        latest_gnss = {
+        gnss_info[
+            "gnss_status"
+        ] = "FIX"
 
-            "gnss_status": "FIX",
+        gnss_info[
+            "latitude"
+        ] = latitude
 
-            "latitude": latitude,
+        gnss_info[
+            "longitude"
+        ] = longitude
 
-            "longitude": longitude,
+        gnss_info[
+            "altitude_m"
+        ] = altitude
 
-            "altitude_m": altitude,
+        gnss_info[
+            "satellites"
+        ] = satellites
 
-            "satellites": satellites,
-
-            "gps_utc": gps_utc,
-        }
+        gnss_info[
+            "gps_utc"
+        ] = gps_utc
 
         return True
 
     except Exception:
 
-        latest_gnss["gnss_status"] = "NO FIX"
+        gnss_info[
+            "gnss_status"
+        ] = "NO FIX"
 
         return False
 
 
-def update_gnss():
+# ============================================================
+# PRINT GNSS + CURRENT PRESSURE
+# ============================================================
+
+def print_capture_status(
+    current_raw
+):
+
+    timestamp = time.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
     print()
-    print("🛰️ Checking GNSS...")
-
-    fixed = get_gnss_location()
-
-    if not fixed:
-
-        print("🛰️ GNSS: NO FIX")
-
-        return
-
-    print(
-        "📍 GNSS FIX | "
-        f"LAT={latest_gnss['latitude']} | "
-        f"LON={latest_gnss['longitude']} | "
-        f"ALT={latest_gnss['altitude_m']} m | "
-        f"SAT={latest_gnss['satellites']}"
-    )
 
     print(
         f"device_id={DEVICE_ID}, "
-        f"BP_raw=0, "
-        f"FP_raw=0, "
-        f"CR_raw=0, "
-        f"BC_raw=0, "
-        f"GNSS=FIX, "
-        f"LAT={latest_gnss['latitude']}, "
-        f"LON={latest_gnss['longitude']}, "
-        f"SAT={latest_gnss['satellites']}"
+        f"BP_raw={current_raw[0]}, "
+        f"FP_raw={current_raw[1]}, "
+        f"CR_raw={current_raw[2]}, "
+        f"BC_raw={current_raw[3]}, "
+        f"GNSS={gnss_info['gnss_status']}, "
+        f"LAT={gnss_info['latitude']}, "
+        f"LON={gnss_info['longitude']}, "
+        f"ALT={gnss_info['altitude_m']}, "
+        f"SAT={gnss_info['satellites']}, "
+        f"Timestamp={timestamp}, "
+        f"GSM={gsm_info['gsm_status']}, "
+        f"RSSI={gsm_info['signal_strength']}, "
+        f"dBm={gsm_info['signal_dbm']}, "
+        f"Latency={gsm_info['latency_ms']} ms",
+        flush=True
     )
 
 
 # ============================================================
-# PRESSURE LOGIC
+# DATABASE INSERT
 # ============================================================
 
-def process_pressure(
-    bp,
-    fp,
-    cr,
-    bc
+def insert_record(
+    current_raw,
+    record_type
 ):
 
-    global first_pressure_stored
-    global first_gnss_fix_stored
-    global last_raw
-
-    current_raw = (
-        bp,
-        fp,
-        cr,
-        bc
+    timestamp = time.strftime(
+        "%Y-%m-%d %H:%M:%S"
     )
 
-    # --------------------------------------------------------
-    # FIRST PRESSURE READING
-    # --------------------------------------------------------
+    bp = int(current_raw[0])
+    fp = int(current_raw[1])
+    cr = int(current_raw[2])
+    bc = int(current_raw[3])
 
-    if not first_pressure_stored:
+    conn = None
 
-        print()
-        print("📌 FIRST PRESSURE READING")
+    try:
 
-        print(
-            f"   BP = {bp}"
-        )
-        print(
-            f"   FP = {fp}"
-        )
-        print(
-            f"   CR = {cr}"
-        )
-        print(
-            f"   BC = {bc}"
-        )
-
-        success = insert_database_record(
-            bp,
-            fp,
-            cr,
-            bc,
-            record_type="PRESSURE"
-        )
-
-        if success:
-
-            first_pressure_stored = True
-
-            # IMPORTANT:
-            # last_raw changes ONLY after successful
-            # pressure insertion.
-
-            last_raw = current_raw
-
-        return
-
-    # --------------------------------------------------------
-    # FIRST GNSS FIX
-    #
-    # This is checked independently of pressure.
-    # --------------------------------------------------------
-
-    if (
-        not first_gnss_fix_stored
-        and latest_gnss["gnss_status"] == "FIX"
-    ):
-
-        print()
-        print("🛰️✅ FIRST GNSS FIX RECEIVED")
-        print("📥 One GNSS record will be stored in SQLite")
-
-        print(
-            f"📍 GNSS FIX | "
-            f"LAT={latest_gnss['latitude']} | "
-            f"LON={latest_gnss['longitude']} | "
-            f"ALT={latest_gnss['altitude_m']} m | "
-            f"SAT={latest_gnss['satellites']}"
-        )
-
-        print(
-            f"device_id={DEVICE_ID}, "
-            f"BP_raw={bp}, "
-            f"FP_raw={fp}, "
-            f"CR_raw={cr}, "
-            f"BC_raw={bc}, "
-            f"GNSS=FIX, "
-            f"LAT={latest_gnss['latitude']}, "
-            f"LON={latest_gnss['longitude']}, "
-            f"SAT={latest_gnss['satellites']}"
-        )
-
-        success = insert_database_record(
-            bp,
-            fp,
-            cr,
-            bc,
-            record_type="GNSS"
-        )
-
-        if success:
-
-            # IMPORTANT:
-            # GPS-only record does NOT modify last_raw.
-
-            first_gnss_fix_stored = True
-
-        return
-
-    # --------------------------------------------------------
-    # PRESSURE CHANGE CALCULATION
-    # --------------------------------------------------------
-
-    if last_raw is None:
-
-        return
-
-    bp_diff = abs(
-        bp - last_raw[0]
-    )
-
-    fp_diff = abs(
-        fp - last_raw[1]
-    )
-
-    cr_diff = abs(
-        cr - last_raw[2]
-    )
-
-    bc_diff = abs(
-        bc - last_raw[3]
-    )
-
-    # --------------------------------------------------------
-    # ANY CHANNEL >= 326
-    # --------------------------------------------------------
-
-    if (
-        bp_diff >= RAW_THRESHOLD
-        or fp_diff >= RAW_THRESHOLD
-        or cr_diff >= RAW_THRESHOLD
-        or bc_diff >= RAW_THRESHOLD
-    ):
-
-        print()
-        print("⚠️ PRESSURE CHANGE DETECTED")
-
-        print(
-            f"   BP diff = {bp_diff}"
-        )
-        print(
-            f"   FP diff = {fp_diff}"
-        )
-        print(
-            f"   CR diff = {cr_diff}"
-        )
-        print(
-            f"   BC diff = {bc_diff}"
-        )
-
-        print()
-        print("📊 CURRENT PRESSURE")
-
-        print(f"   BP = {bp}")
-        print(f"   FP = {fp}")
-        print(f"   CR = {cr}")
-        print(f"   BC = {bc}")
-
-        success = insert_database_record(
-            bp,
-            fp,
-            cr,
-            bc,
-            record_type="PRESSURE"
-        )
-
-        if success:
-
-            # IMPORTANT:
-            # Update last_raw ONLY after successful DB insert.
-
-            last_raw = current_raw
-
-    else:
+        conn = get_db_connection()
 
         # ----------------------------------------------------
-        # NO SIGNIFICANT PRESSURE CHANGE
+        # EXACTLY 23 COLUMNS
         # ----------------------------------------------------
 
+        sql = """
+            INSERT INTO brake_pressure_log
+            (
+                device_id,
+
+                BP_raw,
+                FP_raw,
+                CR_raw,
+                BC_raw,
+
+                timestamp,
+                uploaded,
+
+                gsm_status,
+                sim_status,
+                sim_iccid,
+                mobile_number,
+                signal_strength,
+                signal_dbm,
+                network_status,
+                operator,
+                latency_ms,
+
+                gnss_status,
+                latitude,
+                longitude,
+                altitude_m,
+                satellites,
+                gps_utc
+            )
+            VALUES
+            (
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?
+            )
+        """
+
+        # ----------------------------------------------------
+        # EXACTLY 22 VALUES FOR THE 22 NON-ID COLUMNS
+        #
+        # SQLite generates id automatically.
+        # ----------------------------------------------------
+
+        values = (
+            DEVICE_ID,
+
+            bp,
+            fp,
+            cr,
+            bc,
+
+            timestamp,
+            0,
+
+            gsm_info["gsm_status"],
+            gsm_info["sim_status"],
+            gsm_info["sim_iccid"],
+            gsm_info["mobile_number"],
+            gsm_info["signal_strength"],
+            gsm_info["signal_dbm"],
+            gsm_info["network_status"],
+            gsm_info["operator"],
+            gsm_info["latency_ms"],
+
+            gnss_info["gnss_status"],
+            gnss_info["latitude"],
+            gnss_info["longitude"],
+            gnss_info["altitude_m"],
+            gnss_info["satellites"],
+            gnss_info["gps_utc"]
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            sql,
+            values
+        )
+
+        conn.commit()
+
+        db_id = cursor.lastrowid
+
+        # ----------------------------------------------------
+        # GNSS INSERT
+        # ----------------------------------------------------
+
+        if record_type == "GNSS":
+
+            print()
+            print(
+                "🛰️📥 FIRST GNSS FIX STORED",
+                flush=True
+            )
+
+            print(
+                f"   DB ID       : {db_id}",
+                flush=True
+            )
+
+            print(
+                f"   Latitude    : "
+                f"{gnss_info['latitude']}",
+                flush=True
+            )
+
+            print(
+                f"   Longitude   : "
+                f"{gnss_info['longitude']}",
+                flush=True
+            )
+
+            print(
+                f"   Altitude    : "
+                f"{gnss_info['altitude_m']} m",
+                flush=True
+            )
+
+            print(
+                f"   Satellites  : "
+                f"{gnss_info['satellites']}",
+                flush=True
+            )
+
+        # ----------------------------------------------------
+        # PRESSURE INSERT
+        # ----------------------------------------------------
+
+        else:
+
+            print()
+            print(
+                "💾 PRESSURE DATA STORED",
+                flush=True
+            )
+
+            print(
+                f"   DB ID       : {db_id}",
+                flush=True
+            )
+
+            print(
+                f"   BP_raw      : {bp}",
+                flush=True
+            )
+
+            print(
+                f"   FP_raw      : {fp}",
+                flush=True
+            )
+
+            print(
+                f"   CR_raw      : {cr}",
+                flush=True
+            )
+
+            print(
+                f"   BC_raw      : {bc}",
+                flush=True
+            )
+
+            print(
+                f"   GSM Status  : "
+                f"{gsm_info['gsm_status']}",
+                flush=True
+            )
+
+            print(
+                f"   RSSI        : "
+                f"{gsm_info['signal_strength']}",
+                flush=True
+            )
+
+            print(
+                f"   Signal dBm  : "
+                f"{gsm_info['signal_dbm']}",
+                flush=True
+            )
+
+            print(
+                f"   Latency     : "
+                f"{gsm_info['latency_ms']} ms",
+                flush=True
+            )
+
+            print(
+                f"   GNSS        : "
+                f"{gnss_info['gnss_status']}",
+                flush=True
+            )
+
+            print(
+                f"   LAT         : "
+                f"{gnss_info['latitude']}",
+                flush=True
+            )
+
+            print(
+                f"   LON         : "
+                f"{gnss_info['longitude']}",
+                flush=True
+            )
+
+            print(
+                f"   SAT         : "
+                f"{gnss_info['satellites']}",
+                flush=True
+            )
+
+            print(
+                f"   Timestamp   : "
+                f"{timestamp}",
+                flush=True
+            )
+
+        return True
+
+    except Exception as e:
+
+        print()
         print(
-            f"\r⏭ No significant pressure change "
-            f"→ Skipped DB insert "
-            f"(BP={bp}, FP={fp}, CR={cr}, BC={bc})",
-            end="",
+            "❌ DATABASE INSERT FAILED",
             flush=True
         )
+
+        print(
+            f"Error: {e}",
+            flush=True
+        )
+
+        return False
+
+    finally:
+
+        if conn:
+
+            conn.close()
 
 
 # ============================================================
@@ -1296,104 +1478,178 @@ def process_pressure(
 
 def main():
 
+    global last_raw
+
+    global first_pressure_stored
+    global first_gnss_fix_stored
+
     global last_gsm_update
     global last_gnss_update
 
+    # --------------------------------------------------------
+    # DATABASE
+    # --------------------------------------------------------
+
     initialize_database()
 
-    if not initialize_ads():
-
-        return
+    # --------------------------------------------------------
+    # ADS STATUS
+    # --------------------------------------------------------
 
     print()
-    print("🔌 Initializing EC200U...")
 
-    if not open_gsm():
+    if not ADS_AVAILABLE:
 
-        print()
         print(
-            "⚠️ EC200U unavailable."
-        )
-        print(
-            "Pressure logging will continue."
+            "⚠️ ADS1115 sensor not detected!",
+            flush=True
         )
 
-    else:
+    # --------------------------------------------------------
+    # EC200U
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "🔌 Initializing EC200U...",
+        flush=True
+    )
+
+    modem_ok = open_ec200u()
+
+    if modem_ok:
 
         print(
-            "🛰️ Starting / checking GNSS..."
+            "🛰️ Starting / checking GNSS...",
+            flush=True
         )
 
         start_gnss()
 
+    else:
+
+        print(
+            "⚠️ EC200U unavailable",
+            flush=True
+        )
+
+        print(
+            "⚠️ Pressure logging will continue",
+            flush=True
+        )
+
+    # --------------------------------------------------------
+    # INITIAL GSM INFORMATION
+    # --------------------------------------------------------
+
+    print()
+
+    print(
+        "📡 Updating GSM information...",
+        flush=True
+    )
+
+    update_gsm_information()
+
+    # --------------------------------------------------------
+    # GSM INFORMATION SHOWN ONLY ONCE
+    # --------------------------------------------------------
+
+    print_gsm_information()
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
     print()
     print("=" * 75)
-    print("🚀 Capture system started")
+    print(
+        "🚀 Capture system started",
+        flush=True
+    )
     print("=" * 75)
 
     print(
-        f"📊 RAW_THRESHOLD = {RAW_THRESHOLD}"
+        f"📊 RAW_THRESHOLD = {RAW_THRESHOLD}",
+        flush=True
     )
 
     print(
-        f"⏱ READ_INTERVAL = {READ_INTERVAL} sec"
+        f"⏱ READ_INTERVAL = {READ_INTERVAL} sec",
+        flush=True
     )
 
     print(
-        f"📡 GSM interval = {GSM_INTERVAL} sec"
+        f"📡 GSM interval = {GSM_INTERVAL} sec",
+        flush=True
     )
 
     print(
-        f"🛰️ GNSS interval = {GNSS_INTERVAL} sec"
+        f"🛰️ GNSS interval = {GNSS_INTERVAL} sec",
+        flush=True
     )
 
     print()
     print("📌 DATABASE LOGIC")
 
     print(
-        "1. First pressure reading → STORE"
+        "1. First pressure reading → STORE",
+        flush=True
     )
 
     print(
-        "2. First GNSS FIX → STORE ONE additional record"
+        "2. First GNSS FIX → STORE ONE additional record",
+        flush=True
     )
 
     print(
-        "3. GPS polling without pressure change → SKIP"
+        "3. GPS polling without pressure change → SKIP",
+        flush=True
     )
 
     print(
-        "4. Any pressure difference >= 326 → STORE ALL 4 readings"
+        "4. Any pressure difference >= 326 → STORE ALL 4 readings",
+        flush=True
     )
 
     print(
-        "5. Pressure difference < 326 → SKIP"
+        "5. Pressure difference < 326 → SKIP",
+        flush=True
     )
 
     print(
-        "6. GPS-only record does NOT change last_raw"
+        "6. GPS-only record does NOT change last_raw",
+        flush=True
     )
 
     print(
-        "7. GSM disconnect → automatic reconnect"
+        "7. GSM disconnect → automatic reconnect",
+        flush=True
     )
 
     print(
-        "8. EC200U recovery → automatic GNSS restart"
+        "8. EC200U recovery → GNSS automatically checked/restarted",
+        flush=True
     )
 
     print(
-        "9. Pressure logging continues even if GSM is offline"
+        "9. Pressure logging continues if GSM is offline",
+        flush=True
     )
 
     print("=" * 75)
 
     # --------------------------------------------------------
-    # Timers
+    # TIMERS
     # --------------------------------------------------------
 
-    last_gsm_update = 0
-    last_gnss_update = 0
+    last_gsm_update = time.time()
+
+    last_gnss_update = time.time()
+
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
 
     try:
 
@@ -1401,46 +1657,273 @@ def main():
 
             now = time.time()
 
-            # ------------------------------------------------
-            # GSM
-            # ------------------------------------------------
+            # =================================================
+            # GSM INFORMATION
+            # =================================================
 
             if (
                 now - last_gsm_update
                 >= GSM_INTERVAL
             ):
 
+                # ------------------------------------------------
+                # Update silently.
+                # Do NOT print the complete GSM block again.
+                # ------------------------------------------------
+
                 update_gsm_information()
 
                 last_gsm_update = now
 
-            # ------------------------------------------------
+            # =================================================
             # GNSS
-            # ------------------------------------------------
+            # =================================================
 
             if (
                 now - last_gnss_update
                 >= GNSS_INTERVAL
             ):
 
-                update_gnss()
+                print()
+                print(
+                    "🛰️ Checking GNSS...",
+                    flush=True
+                )
+
+                gps_fix = read_gnss()
+
+                if gps_fix:
+
+                    print(
+                        f"📍 GNSS FIX | "
+                        f"LAT={gnss_info['latitude']} | "
+                        f"LON={gnss_info['longitude']} | "
+                        f"ALT={gnss_info['altitude_m']} m | "
+                        f"SAT={gnss_info['satellites']}",
+                        flush=True
+                    )
+
+                else:
+
+                    print(
+                        "🛰️ GNSS: NO FIX",
+                        flush=True
+                    )
 
                 last_gnss_update = now
 
-            # ------------------------------------------------
+            # =================================================
             # PRESSURE
-            # ------------------------------------------------
+            # =================================================
 
-            pressure = read_pressure()
+            current_raw = read_raw_values()
 
-            if pressure is not None:
+            # -------------------------------------------------
+            # FIRST PRESSURE READING
+            # -------------------------------------------------
 
-                process_pressure(
-                    pressure[0],
-                    pressure[1],
-                    pressure[2],
-                    pressure[3]
+            if not first_pressure_stored:
+
+                print()
+                print(
+                    "📌 FIRST PRESSURE READING",
+                    flush=True
                 )
+
+                print(
+                    f"   BP = {current_raw[0]}",
+                    flush=True
+                )
+
+                print(
+                    f"   FP = {current_raw[1]}",
+                    flush=True
+                )
+
+                print(
+                    f"   CR = {current_raw[2]}",
+                    flush=True
+                )
+
+                print(
+                    f"   BC = {current_raw[3]}",
+                    flush=True
+                )
+
+                # ---------------------------------------------
+                # STORE FIRST PRESSURE
+                # ---------------------------------------------
+
+                success = insert_record(
+                    current_raw,
+                    "PRESSURE"
+                )
+
+                if success:
+
+                    first_pressure_stored = True
+
+                    # IMPORTANT:
+                    # Only pressure insert changes last_raw.
+
+                    last_raw = current_raw
+
+                time.sleep(
+                    READ_INTERVAL
+                )
+
+                continue
+
+            # =================================================
+            # FIRST GNSS FIX
+            # =================================================
+
+            if (
+                not first_gnss_fix_stored
+                and
+                gnss_info["gnss_status"] == "FIX"
+            ):
+
+                print()
+                print(
+                    "🛰️✅ FIRST GNSS FIX RECEIVED",
+                    flush=True
+                )
+
+                print(
+                    "📥 One GNSS record will be stored in SQLite",
+                    flush=True
+                )
+
+                print(
+                    f"📍 GNSS FIX | "
+                    f"LAT={gnss_info['latitude']} | "
+                    f"LON={gnss_info['longitude']} | "
+                    f"ALT={gnss_info['altitude_m']} m | "
+                    f"SAT={gnss_info['satellites']}",
+                    flush=True
+                )
+
+                # ------------------------------------------------
+                # Show complete record before insertion
+                # ------------------------------------------------
+
+                print_capture_status(
+                    current_raw
+                )
+
+                # ------------------------------------------------
+                # STORE GNSS RECORD
+                # ------------------------------------------------
+
+                success = insert_record(
+                    current_raw,
+                    "GNSS"
+                )
+
+                if success:
+
+                    first_gnss_fix_stored = True
+
+                    # IMPORTANT:
+                    # DO NOT CHANGE last_raw HERE.
+                    #
+                    # GPS-only insertion must not affect
+                    # pressure threshold calculation.
+
+                time.sleep(
+                    READ_INTERVAL
+                )
+
+                continue
+
+            # =================================================
+            # PRESSURE CHANGE CHECK
+            # =================================================
+
+            bp_diff = abs(
+                current_raw[0] - last_raw[0]
+            )
+
+            fp_diff = abs(
+                current_raw[1] - last_raw[1]
+            )
+
+            cr_diff = abs(
+                current_raw[2] - last_raw[2]
+            )
+
+            bc_diff = abs(
+                current_raw[3] - last_raw[3]
+            )
+
+            # =================================================
+            # SIGNIFICANT PRESSURE CHANGE
+            # =================================================
+
+            if (
+                bp_diff >= RAW_THRESHOLD
+                or
+                fp_diff >= RAW_THRESHOLD
+                or
+                cr_diff >= RAW_THRESHOLD
+                or
+                bc_diff >= RAW_THRESHOLD
+            ):
+
+                print()
+                print(
+                    "⚠️ PRESSURE CHANGE DETECTED",
+                    flush=True
+                )
+
+                print(
+                    f"   BP difference = {bp_diff}",
+                    flush=True
+                )
+
+                print(
+                    f"   FP difference = {fp_diff}",
+                    flush=True
+                )
+
+                print(
+                    f"   CR difference = {cr_diff}",
+                    flush=True
+                )
+
+                print(
+                    f"   BC difference = {bc_diff}",
+                    flush=True
+                )
+
+                print_capture_status(
+                    current_raw
+                )
+
+                # ------------------------------------------------
+                # STORE ALL FOUR PRESSURES
+                # ------------------------------------------------
+
+                success = insert_record(
+                    current_raw,
+                    "PRESSURE"
+                )
+
+                if success:
+
+                    # IMPORTANT:
+                    # last_raw changes ONLY after successful
+                    # pressure DB insertion.
+
+                    last_raw = current_raw
+
+            # =================================================
+            # NO SIGNIFICANT CHANGE
+            # =================================================
+
+            # Do not print every 0.1 second.
+            # This prevents SSH from being flooded.
 
             time.sleep(
                 READ_INTERVAL
@@ -1450,15 +1933,18 @@ def main():
 
         print()
         print()
-        print("🛑 Capture system stopped by user")
+        print(
+            "🛑 Capture system stopped",
+            flush=True
+        )
 
     finally:
 
-        close_gsm()
+        close_ec200u()
 
 
 # ============================================================
-# PROGRAM ENTRY
+# PROGRAM START
 # ============================================================
 
 if __name__ == "__main__":

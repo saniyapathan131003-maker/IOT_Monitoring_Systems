@@ -1,4 +1,4 @@
-
+```python
 #!/usr/bin/env python3
 
 import os
@@ -43,12 +43,10 @@ KEY_PATH = os.path.join(
 
 
 # ============================================================
-# AWS IoT CONFIGURATION
+# AWS IoT
 # ============================================================
 
-MQTT_ENDPOINT = (
-    "a1vddjuckiz90j-ats.iot.ap-south-1.amazonaws.com"
-)
+MQTT_ENDPOINT = "a1vddjuckiz90j-ats.iot.ap-south-1.amazonaws.com"
 
 MQTT_PORT = 8883
 
@@ -71,34 +69,15 @@ connection_event = threading.Event()
 
 
 # ============================================================
-# MQTT CALLBACK - CONNECT
+# MQTT CONNECT CALLBACK
 # ============================================================
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
 
     global mqtt_connected
 
-    # Paho MQTT v2 reason_code
-    rc = int(reason_code)
-
-    if rc == 0:
-
-        with mqtt_lock:
-            mqtt_connected = True
-
-        connection_event.set()
-
-        print()
-        print("======================================================")
-        print("✅ AWS IoT Core CONNECTED")
-        print("======================================================")
-        print(f"📡 Endpoint : {MQTT_ENDPOINT}")
-        print(f"📤 Topic    : {TOPIC}")
-        print(f"🆔 Client ID: {CLIENT_ID}")
-        print("======================================================")
-        print()
-
-    else:
+    # MQTT v2 ReasonCode
+    if reason_code.is_failure:
 
         with mqtt_lock:
             mqtt_connected = False
@@ -107,13 +86,35 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
 
         print()
         print(
-            f"❌ AWS connection failed | rc={rc}"
+            f"❌ AWS connection failed | Reason={reason_code}"
         )
         print()
 
+        return
+
+
+    # --------------------------------------------------------
+    # SUCCESS
+    # --------------------------------------------------------
+
+    with mqtt_lock:
+        mqtt_connected = True
+
+    connection_event.set()
+
+    print()
+    print("======================================================")
+    print("✅ AWS IoT Core CONNECTED")
+    print("======================================================")
+    print(f"📡 Endpoint : {MQTT_ENDPOINT}")
+    print(f"📤 Topic    : {TOPIC}")
+    print(f"🆔 Client ID: {CLIENT_ID}")
+    print("======================================================")
+    print()
+
 
 # ============================================================
-# MQTT CALLBACK - DISCONNECT
+# MQTT DISCONNECT CALLBACK
 # ============================================================
 
 def on_disconnect(
@@ -131,33 +132,36 @@ def on_disconnect(
 
     connection_event.clear()
 
-    rc = int(reason_code)
+    # --------------------------------------------------------
+    # DO NOT CONVERT ReasonCode USING int()
+    # --------------------------------------------------------
 
-    # rc=0 means normal disconnect.
-    # Do not print it as an error.
-    if rc == 0:
+    reason = str(reason_code)
+
+    if reason == "Normal disconnection":
 
         print()
         print(
             "🔌 AWS MQTT disconnected normally."
         )
+        print()
 
     else:
 
         print()
         print(
-            f"⚠️ AWS MQTT connection lost | rc={rc}"
+            f"⚠️ AWS MQTT connection lost | Reason={reason_code}"
         )
 
         print(
-            "🔄 Paho MQTT will automatically reconnect..."
+            "🔄 Automatic reconnect is active..."
         )
 
-    print()
+        print()
 
 
 # ============================================================
-# CHECK CONNECTION
+# MQTT CONNECTION STATUS
 # ============================================================
 
 def is_mqtt_connected():
@@ -204,48 +208,76 @@ mqtt_client.on_disconnect = on_disconnect
 # ============================================================
 
 mqtt_client.reconnect_delay_set(
-    min_delay=3,
-    max_delay=30
+    min_delay=2,
+    max_delay=15
 )
 
 
 # ============================================================
-# SQLITE CONNECTION
+# SQLITE
 # ============================================================
 
-def create_database_connection():
+db = sqlite3.connect(
+    DB_PATH,
+    timeout=10,
+    check_same_thread=False
+)
 
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=10,
-        check_same_thread=False
-    )
-
-    conn.row_factory = sqlite3.Row
-
-    conn.execute(
-        "PRAGMA journal_mode=WAL"
-    )
-
-    conn.execute(
-        "PRAGMA busy_timeout=10000"
-    )
-
-    return conn
-
-
-db = create_database_connection()
+db.row_factory = sqlite3.Row
 
 cursor = db.cursor()
 
+# ------------------------------------------------------------
+# WAL allows capture script and uploader to work together
+# ------------------------------------------------------------
+
+cursor.execute(
+    "PRAGMA journal_mode=WAL"
+)
+
+cursor.execute(
+    "PRAGMA busy_timeout=10000"
+)
+
+db.commit()
+
 
 # ============================================================
-# CREATE PAYLOAD
+# CHECK REQUIRED TABLE
+# ============================================================
+
+cursor.execute(
+    """
+    SELECT name
+    FROM sqlite_master
+    WHERE type='table'
+    AND name='brake_pressure_log'
+    """
+)
+
+if cursor.fetchone() is None:
+
+    print()
+    print(
+        "❌ ERROR: brake_pressure_log table not found."
+    )
+    print(
+        f"Database: {DB_PATH}"
+    )
+    print()
+
+    db.close()
+
+    raise SystemExit(1)
+
+
+# ============================================================
+# CREATE AWS PAYLOAD
 # ============================================================
 
 def create_payload(row):
 
-    return {
+    payload = {
 
         # ----------------------------------------------------
         # DATABASE
@@ -269,7 +301,7 @@ def create_payload(row):
         "BC_raw": row["BC_raw"],
 
         # ----------------------------------------------------
-        # TIMESTAMP
+        # TIME
         # ----------------------------------------------------
 
         "timestamp": row["timestamp"],
@@ -296,7 +328,6 @@ def create_payload(row):
         # ----------------------------------------------------
 
         "gnss_status": row["gnss_status"],
-
         "latitude": row["latitude"],
         "longitude": row["longitude"],
         "altitude_m": row["altitude_m"],
@@ -306,9 +337,11 @@ def create_payload(row):
         "gps_utc": row["gps_utc"]
     }
 
+    return payload
+
 
 # ============================================================
-# GET ONE PENDING RECORD
+# GET OLDEST UNSENT RECORD
 # ============================================================
 
 def get_pending_record():
@@ -337,95 +370,70 @@ def get_pending_record():
 
 
 # ============================================================
-# PRINT LOCAL RECORD
+# MARK RECORD UPLOADED
 # ============================================================
 
-def print_local_record(row):
+def mark_uploaded(row_id):
 
-    print()
-    print("======================================================")
-    print(
-        f"📥 LOCAL SQLITE RECORD | ID={row['id']}"
-    )
-    print("======================================================")
+    try:
 
-    print(
-        f"device_id={row['device_id']}"
-    )
+        cursor.execute(
+            """
+            UPDATE brake_pressure_log
+            SET uploaded = 1
+            WHERE id = ?
+            """,
+            (row_id,)
+        )
 
-    print(
-        f"BP_raw={row['BP_raw']}, "
-        f"FP_raw={row['FP_raw']}, "
-        f"CR_raw={row['CR_raw']}, "
-        f"BC_raw={row['BC_raw']}"
-    )
+        db.commit()
 
-    print(
-        f"GNSS={row['gnss_status']}, "
-        f"LAT={row['latitude']}, "
-        f"LON={row['longitude']}, "
-        f"ALT={row['altitude_m']} m, "
-        f"SAT={row['satellites']}"
-    )
+        return True
 
-    print(
-        f"GSM={row['gsm_status']}, "
-        f"SIM={row['sim_status']}, "
-        f"RSSI={row['signal_strength']}, "
-        f"dBm={row['signal_dbm']}, "
-        f"Network={row['network_status']}, "
-        f"Operator={row['operator']}, "
-        f"Latency={row['latency_ms']} ms"
-    )
+    except sqlite3.Error as e:
 
-    print(
-        f"Timestamp={row['timestamp']}"
-    )
+        print(
+            f"❌ SQLite update error | ID={row_id} | {e}"
+        )
+
+        return False
 
 
 # ============================================================
-# WAIT FOR AWS CONNECTION
+# WAIT FOR AWS
 # ============================================================
 
-def wait_for_aws():
+def wait_for_connection():
 
     while not is_mqtt_connected():
 
         print(
-            "⏳ Waiting for AWS IoT connection..."
+            "⏳ Waiting for AWS connection..."
         )
 
         # ----------------------------------------------------
-        # Paho is already running in background.
-        # It automatically reconnects.
+        # Paho background loop handles reconnect automatically
         # ----------------------------------------------------
 
         connection_event.wait(
             timeout=5
         )
 
-    return True
-
 
 # ============================================================
-# UPLOAD ONE RECORD
+# PUBLISH ONE RECORD
 # ============================================================
 
-def upload_record(row):
+def publish_record(row):
 
     row_id = row["id"]
 
 
     # ========================================================
-    # CHECK AWS
+    # CHECK CONNECTION
     # ========================================================
 
     if not is_mqtt_connected():
-
-        print()
-        print(
-            "⚠️ AWS is currently disconnected."
-        )
 
         return False
 
@@ -444,40 +452,68 @@ def upload_record(row):
 
 
     # ========================================================
-    # PRINT LOCAL DATA
-    # ========================================================
-
-    print_local_record(row)
-
-
-    # ========================================================
-    # PUBLISH
+    # DISPLAY DATA
     # ========================================================
 
     print()
+    print("------------------------------------------------------")
+
     print(
-        "📤 Publishing data to AWS IoT Core..."
+        f"📥 DB ID={row_id} | "
+        f"Device={row['device_id']}"
     )
 
+    print(
+        f"BP_raw={row['BP_raw']}, "
+        f"FP_raw={row['FP_raw']}, "
+        f"CR_raw={row['CR_raw']}, "
+        f"BC_raw={row['BC_raw']}"
+    )
+
+    print(
+        f"GNSS={row['gnss_status']}, "
+        f"LAT={row['latitude']}, "
+        f"LON={row['longitude']}, "
+        f"SAT={row['satellites']}"
+    )
+
+    print(
+        f"GSM={row['gsm_status']}, "
+        f"RSSI={row['signal_strength']}, "
+        f"dBm={row['signal_dbm']}, "
+        f"Network={row['network_status']}"
+    )
+
+    print(
+        f"Timestamp={row['timestamp']}"
+    )
+
+    print(
+        "📤 Publishing to AWS..."
+    )
+
+
+    # ========================================================
+    # MQTT PUBLISH
+    # ========================================================
 
     try:
 
         result = mqtt_client.publish(
-            topic=TOPIC,
-            payload=payload_json,
+            TOPIC,
+            payload_json,
             qos=1
         )
 
 
         # ----------------------------------------------------
-        # CHECK MQTT PUBLISH REQUEST
+        # PUBLISH REQUEST FAILED
         # ----------------------------------------------------
 
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
 
-            print()
             print(
-                f"❌ MQTT publish failed | "
+                f"❌ Publish request failed | "
                 f"ID={row_id} | rc={result.rc}"
             )
 
@@ -485,7 +521,7 @@ def upload_record(row):
 
 
         # ----------------------------------------------------
-        # WAIT FOR QoS 1 CONFIRMATION
+        # WAIT FOR QoS 1 PUBACK
         # ----------------------------------------------------
 
         result.wait_for_publish(
@@ -494,12 +530,11 @@ def upload_record(row):
 
 
         # ----------------------------------------------------
-        # CHECK CONFIRMATION
+        # CONFIRM PUBLISHED
         # ----------------------------------------------------
 
         if not result.is_published():
 
-            print()
             print(
                 f"❌ AWS publish not confirmed | "
                 f"ID={row_id}"
@@ -509,7 +544,7 @@ def upload_record(row):
 
 
         # ====================================================
-        # AWS SUCCESS
+        # SUCCESS
         # ====================================================
 
         print()
@@ -517,39 +552,24 @@ def upload_record(row):
         print("📤 AWS SENT PAYLOAD")
         print("======================================================")
 
-        print(
-            payload_json
-        )
+        print(payload_json)
 
         print("======================================================")
 
 
         print(
-            f"✅ AWS upload confirmed | ID={row_id}"
+            f"✅ AWS PUBLISH SUCCESS | ID={row_id}"
         )
 
 
         # ====================================================
-        # UPDATE SQLITE ONLY AFTER AWS SUCCESS
+        # UPDATE SQLITE
         # ====================================================
 
-        try:
-
-            cursor.execute(
-                """
-                UPDATE brake_pressure_log
-                SET uploaded = 1
-                WHERE id = ?
-                """,
-                (row_id,)
-            )
-
-            db.commit()
-
+        if mark_uploaded(row_id):
 
             print(
-                f"✅ SQLite updated | "
-                f"ID={row_id} | uploaded=1"
+                f"✅ DB UPDATED | ID={row_id} | uploaded=1"
             )
 
             print()
@@ -557,26 +577,27 @@ def upload_record(row):
             return True
 
 
-        except sqlite3.Error as e:
+        # ----------------------------------------------------
+        # AWS succeeded but SQLite update failed
+        # ----------------------------------------------------
 
-            print(
-                f"❌ SQLite update error | "
-                f"ID={row_id} | {e}"
-            )
+        print(
+            f"⚠️ AWS received ID={row_id}, "
+            f"but SQLite update failed."
+        )
 
-            return False
+        return False
 
 
     except Exception as e:
 
         print()
         print(
-            f"❌ AWS publish exception | "
-            f"ID={row_id}"
+            f"❌ AWS publish error | ID={row_id}"
         )
 
         print(
-            f"   Error: {e}"
+            f"   {e}"
         )
 
         return False
@@ -592,24 +613,16 @@ try:
     print("======================================================")
     print("🚀 AWS OFFLINE UPLOADER")
     print("======================================================")
-    print(
-        f"📂 Database : {DB_PATH}"
-    )
-    print(
-        f"📡 Endpoint : {MQTT_ENDPOINT}"
-    )
-    print(
-        f"📤 Topic    : {TOPIC}"
-    )
-    print(
-        f"🆔 Client ID: {CLIENT_ID}"
-    )
+    print(f"📂 Database : {DB_PATH}")
+    print(f"📡 Endpoint : {MQTT_ENDPOINT}")
+    print(f"📤 Topic    : {TOPIC}")
+    print(f"🆔 Client ID: {CLIENT_ID}")
     print("======================================================")
     print()
 
 
     # ========================================================
-    # START MQTT BACKGROUND LOOP
+    # START MQTT NETWORK THREAD ONCE
     # ========================================================
 
     print(
@@ -620,7 +633,7 @@ try:
 
 
     # ========================================================
-    # ASYNCHRONOUS AWS CONNECTION
+    # START ASYNC CONNECTION
     # ========================================================
 
     print(
@@ -635,26 +648,26 @@ try:
 
 
     # ========================================================
-    # WAIT UNTIL CONNECTED
+    # WAIT FOR FIRST CONNECTION
     # ========================================================
 
-    wait_for_aws()
+    wait_for_connection()
 
 
     print()
     print(
-        "🚀 AWS offline uploader started."
+        "🚀 AWS OFFLINE UPLOADER STARTED"
     )
 
     print(
-        "📂 Monitoring SQLite for uploaded=0..."
+        "📂 Reading uploaded=0 records..."
     )
 
     print()
 
 
     # ========================================================
-    # MAIN UPLOAD LOOP
+    # CONTINUOUS DATABASE UPLOAD LOOP
     # ========================================================
 
     while True:
@@ -670,69 +683,68 @@ try:
                 "⚠️ AWS disconnected."
             )
 
-            print(
-                "🔄 Waiting for automatic reconnect..."
-            )
-
-            wait_for_aws()
+            wait_for_connection()
 
             continue
 
 
         # ====================================================
-        # GET OLDest PENDING ROW
+        # GET ONE RECORD
         # ====================================================
 
         row = get_pending_record()
 
 
         # ====================================================
-        # NOTHING TO UPLOAD
+        # NO PENDING DATA
         # ====================================================
 
         if row is None:
 
-            time.sleep(1)
+            # ------------------------------------------------
+            # Check DB frequently for new records
+            # ------------------------------------------------
+
+            time.sleep(0.2)
 
             continue
 
 
         # ====================================================
-        # UPLOAD
+        # PUBLISH
         # ====================================================
 
-        success = upload_record(row)
+        success = publish_record(row)
 
 
         # ====================================================
         # FAILED
-        # ====================================================
+        # ========================================================
 
         if not success:
 
             print()
             print(
-                f"⏳ Upload failed | ID={row['id']}"
+                f"⏳ ID={row['id']} NOT uploaded."
             )
 
             print(
-                "⏳ uploaded remains 0"
+                "⏳ Keeping uploaded=0."
             )
 
             print(
-                "🔄 Retrying after 5 seconds..."
+                "🔄 Retrying after 2 seconds..."
             )
 
-            time.sleep(5)
-
+            time.sleep(2)
 
         else:
 
             # ------------------------------------------------
-            # Immediately process next offline record
+            # Immediately check next row
             # ------------------------------------------------
 
-            time.sleep(0.1)
+            time.sleep(0.01)
 
 
 # ============================================================
@@ -755,24 +767,34 @@ finally:
 
     print()
     print(
-        "🔌 Stopping AWS MQTT..."
+        "🔌 Closing AWS connection..."
     )
 
     try:
+
         mqtt_client.disconnect()
+
     except Exception:
         pass
 
+
     try:
+
         mqtt_client.loop_stop()
+
     except Exception:
         pass
 
+
     try:
+
         db.close()
+
     except Exception:
         pass
+
 
     print(
-        "✅ AWS offline uploader stopped."
+        "✅ AWS uploader stopped."
     )
+```

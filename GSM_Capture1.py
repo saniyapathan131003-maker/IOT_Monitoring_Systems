@@ -116,7 +116,6 @@ REQUIRED_COLUMNS = {
 # ============================================================
 
 def get_db_connection():
-
     conn = sqlite3.connect(
         DB_PATH,
         timeout=30,
@@ -147,13 +146,18 @@ def initialize_database():
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS brake_pressure_log (
+
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+
                 device_id TEXT,
+
                 BP_raw INTEGER,
                 FP_raw INTEGER,
                 CR_raw INTEGER,
                 BC_raw INTEGER,
+
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+
                 uploaded INTEGER DEFAULT 0
             )
         """)
@@ -194,7 +198,6 @@ def initialize_database():
         raise
 
     finally:
-
         conn.close()
 
 
@@ -223,7 +226,6 @@ def get_device_id():
         ).fetchone()
 
         if row and row["device_id"]:
-
             return str(row["device_id"])
 
         return "UNKNOWN"
@@ -238,7 +240,6 @@ def get_device_id():
         return "UNKNOWN"
 
     finally:
-
         conn.close()
 
 
@@ -253,11 +254,12 @@ def insert_database_record(
     record_reason
 ):
 
+    # Copy communication state safely
     with state_lock:
-
         gsm = dict(gsm_info)
         gnss = dict(gnss_info)
 
+    # Validate pressure values
     try:
 
         bp_raw = int(pressure_values[0])
@@ -311,12 +313,11 @@ def insert_database_record(
             VALUES
             (
                 ?, ?, ?, ?, ?, ?, 0,
-
                 ?, ?, ?, ?, ?, ?, ?, ?, ?,
-
                 ?, ?, ?, ?, ?, ?
             )
         """, (
+
             device_id,
 
             bp_raw,
@@ -348,7 +349,7 @@ def insert_database_record(
 
         db_id = cursor.lastrowid
 
-        # ONLY PRINT WHEN DB INSERT ACTUALLY HAPPENS
+        # ONLY PRINT WHEN INSERT ACTUALLY HAPPENS
         print(
             f"💾 DB INSERTED | "
             f"ID={db_id} | "
@@ -357,6 +358,10 @@ def insert_database_record(
             f"FP={fp_raw} | "
             f"CR={cr_raw} | "
             f"BC={bc_raw} | "
+            f"GNSS={gnss['gnss_status']} | "
+            f"LAT={gnss['latitude']} | "
+            f"LON={gnss['longitude']} | "
+            f"SAT={gnss['satellites']} | "
             f"Uploaded=0",
             flush=True
         )
@@ -375,7 +380,6 @@ def insert_database_record(
     finally:
 
         if conn is not None:
-
             conn.close()
 
 
@@ -389,9 +393,6 @@ bp_channel = None
 fp_channel = None
 cr_channel = None
 bc_channel = None
-
-# Last valid pressure reading
-last_valid_pressure = (0, 0, 0, 0)
 
 
 def initialize_ads1115():
@@ -423,9 +424,6 @@ def initialize_ads1115():
 
         ads.gain = 1
 
-        # IMPORTANT:
-        # Numeric channel numbers are used.
-        #
         # A0 -> 0
         # A1 -> 1
         # A2 -> 2
@@ -443,7 +441,7 @@ def initialize_ads1115():
             flush=True
         )
 
-        # Test reading
+        # Initial test
         test_values = (
             bp_channel.value,
             fp_channel.value,
@@ -474,13 +472,14 @@ def initialize_ads1115():
         return False
 
 
+# ============================================================
+# READ PRESSURE
+# ============================================================
+
 def read_pressure_values():
 
-    global last_valid_pressure
-
     if not ADS_AVAILABLE:
-
-        return last_valid_pressure
+        return None
 
     try:
 
@@ -489,28 +488,27 @@ def read_pressure_values():
         cr = int(cr_channel.value)
         bc = int(bc_channel.value)
 
-        current = (
+        return (
             bp,
             fp,
             cr,
             bc
         )
 
-        last_valid_pressure = current
-
-        return current
-
     except Exception as e:
 
-        # DO NOT RETURN ZERO.
-        # Keep the previous valid reading.
+        # IMPORTANT:
+        # Do NOT return zero.
+        # Do NOT return old value.
+        #
+        # The current sample is simply ignored.
 
         print(
             f"⚠️ ADS1115 temporary read error: {e}",
             flush=True
         )
 
-        return last_valid_pressure
+        return None
 
 
 # ============================================================
@@ -527,18 +525,15 @@ def close_modem():
         try:
 
             if modem_serial is not None:
-
                 modem_serial.close()
 
         except Exception:
-
             pass
 
         modem_serial = None
         modem_connected = False
 
     with state_lock:
-
         gsm_info["gsm_status"] = "Disconnected"
 
 
@@ -565,7 +560,6 @@ def open_modem():
                         modem_serial.close()
 
                 except Exception:
-
                     pass
 
             modem_serial = serial.Serial(
@@ -580,7 +574,6 @@ def open_modem():
             modem_connected = True
 
         with state_lock:
-
             gsm_info["gsm_status"] = "Connected"
 
         print(
@@ -595,7 +588,6 @@ def open_modem():
         modem_connected = False
 
         with state_lock:
-
             gsm_info["gsm_status"] = "Disconnected"
 
         print(
@@ -618,7 +610,6 @@ def send_at(command, timeout=3):
     with serial_lock:
 
         if modem_serial is None:
-
             return ""
 
         try:
@@ -658,10 +649,16 @@ def send_at(command, timeout=3):
                         errors="ignore"
                     )
 
-                    if "\nOK" in text:
+                    if re.search(
+                        r"(?:^|\r?\n)OK(?:\r?\n|$)",
+                        text
+                    ):
                         break
 
-                    if "\nERROR" in text:
+                    if re.search(
+                        r"(?:^|\r?\n)ERROR(?:\r?\n|$)",
+                        text
+                    ):
                         break
 
                 time.sleep(0.05)
@@ -670,13 +667,17 @@ def send_at(command, timeout=3):
                 errors="ignore"
             ).strip()
 
-        except Exception:
+        except Exception as e:
 
             modem_connected = False
 
             with state_lock:
-
                 gsm_info["gsm_status"] = "Disconnected"
+
+            print(
+                f"⚠️ AT command error ({command}): {e}",
+                flush=True
+            )
 
             return ""
 
@@ -699,7 +700,6 @@ def modem_is_alive():
         modem_connected = True
 
         with state_lock:
-
             gsm_info["gsm_status"] = "Connected"
 
         return True
@@ -707,7 +707,6 @@ def modem_is_alive():
     modem_connected = False
 
     with state_lock:
-
         gsm_info["gsm_status"] = "Disconnected"
 
     return False
@@ -720,7 +719,6 @@ def modem_is_alive():
 def parse_csq(response):
 
     if not response:
-
         return None, None
 
     match = re.search(
@@ -729,7 +727,6 @@ def parse_csq(response):
     )
 
     if not match:
-
         return None, None
 
     try:
@@ -737,7 +734,6 @@ def parse_csq(response):
         rssi = int(match.group(1))
 
         if rssi == 99:
-
             return None, None
 
         dbm = -113 + (2 * rssi)
@@ -756,7 +752,6 @@ def parse_csq(response):
 def parse_registration(response):
 
     if not response:
-
         return "UNKNOWN"
 
     match = re.search(
@@ -765,25 +760,20 @@ def parse_registration(response):
     )
 
     if not match:
-
         return "UNKNOWN"
 
     value = match.group(1)
 
     if value in ("1", "5"):
-
         return "REGISTERED"
 
     if value == "2":
-
         return "SEARCHING"
 
     if value == "3":
-
         return "REGISTRATION DENIED"
 
     if value == "0":
-
         return "NOT REGISTERED"
 
     return "UNKNOWN"
@@ -796,7 +786,6 @@ def parse_registration(response):
 def parse_operator(response):
 
     if not response:
-
         return None
 
     match = re.search(
@@ -805,7 +794,6 @@ def parse_operator(response):
     )
 
     if match:
-
         return match.group(1)
 
     return None
@@ -818,15 +806,14 @@ def parse_operator(response):
 def parse_qping(response):
 
     if not response:
-
         return None
 
     # Typical:
     #
     # +QPING: 0,"8.8.8.8",64,8,255
     #
-    #                 ^
-    #                 latency
+    #                         ^
+    #                       latency
 
     match = re.search(
         r'\+QPING:\s*\d+\s*,\s*"[^"]+"\s*,\s*\d+\s*,\s*([\d.]+)',
@@ -836,32 +823,10 @@ def parse_qping(response):
     if match:
 
         try:
-
-            return float(
-                match.group(1)
-            )
+            return float(match.group(1))
 
         except Exception:
-
-            pass
-
-    # Fallback parser
-    match = re.search(
-        r'\+QPING:.*?,.*?,.*?,\s*([\d.]+)\s*,',
-        response
-    )
-
-    if match:
-
-        try:
-
-            return float(
-                match.group(1)
-            )
-
-        except Exception:
-
-            pass
+            return None
 
     return None
 
@@ -873,7 +838,6 @@ def parse_qping(response):
 def update_gsm_information():
 
     if not modem_is_alive():
-
         return False
 
     # --------------------------------------------------------
@@ -888,11 +852,9 @@ def update_gsm_information():
     sim_status = "UNKNOWN"
 
     if "READY" in sim_response:
-
         sim_status = "READY"
 
     elif "SIM PIN" in sim_response:
-
         sim_status = "SIM PIN"
 
     # --------------------------------------------------------
@@ -912,7 +874,6 @@ def update_gsm_information():
     )
 
     if match:
-
         sim_iccid = match.group(1)
 
     # --------------------------------------------------------
@@ -932,7 +893,6 @@ def update_gsm_information():
     )
 
     if match:
-
         mobile_number = match.group(1)
 
     # --------------------------------------------------------
@@ -1000,20 +960,22 @@ def update_gsm_information():
         )
 
         gsm_info["sim_status"] = sim_status
-
         gsm_info["sim_iccid"] = sim_iccid
-
         gsm_info["mobile_number"] = mobile_number
 
-        gsm_info["signal_strength"] = rssi
-
-        gsm_info["signal_dbm"] = dbm
+        # Only replace signal when a valid value is received
+        if rssi is not None:
+            gsm_info["signal_strength"] = rssi
+            gsm_info["signal_dbm"] = dbm
 
         gsm_info["network_status"] = network_status
 
-        gsm_info["operator"] = operator
+        if operator is not None:
+            gsm_info["operator"] = operator
 
-        gsm_info["latency_ms"] = latency
+        # Do not overwrite previous latency with None
+        if latency is not None:
+            gsm_info["latency_ms"] = latency
 
     return True
 
@@ -1023,10 +985,6 @@ def update_gsm_information():
 # ============================================================
 
 def ensure_gnss():
-
-    if not modem_is_alive():
-
-        return False
 
     response = send_at(
         "AT+QGPS?",
@@ -1057,7 +1015,6 @@ def convert_nmea_coordinate(
     try:
 
         if not value:
-
             return None
 
         value = float(value)
@@ -1077,7 +1034,6 @@ def convert_nmea_coordinate(
         )
 
         if direction in ("S", "W"):
-
             decimal = -decimal
 
         return decimal
@@ -1094,7 +1050,6 @@ def convert_nmea_coordinate(
 def parse_gga(response):
 
     if not response:
-
         return None
 
     for line in response.splitlines():
@@ -1105,13 +1060,11 @@ def parse_gga(response):
             "$GPGGA" not in line
             and "$GNGGA" not in line
         ):
-
             continue
 
         parts = line.split(",")
 
         if len(parts) < 10:
-
             continue
 
         try:
@@ -1124,25 +1077,45 @@ def parse_gga(response):
             lon_raw = parts[4]
             lon_dir = parts[5]
 
-            fix_quality = int(
-                parts[6] or 0
+            # Handle possible checksum safely
+            fix_match = re.match(
+                r"\d+",
+                parts[6] or ""
+            )
+
+            fix_quality = (
+                int(fix_match.group())
+                if fix_match
+                else 0
             )
 
             satellites = None
 
             if parts[7]:
 
-                satellites = int(
+                sat_match = re.match(
+                    r"\d+",
                     parts[7]
                 )
+
+                if sat_match:
+                    satellites = int(
+                        sat_match.group()
+                    )
 
             altitude = None
 
             if parts[9]:
 
-                altitude = float(
+                alt_match = re.match(
+                    r"[-+]?\d+(?:\.\d+)?",
                     parts[9]
                 )
+
+                if alt_match:
+                    altitude = float(
+                        alt_match.group()
+                    )
 
             latitude = convert_nmea_coordinate(
                 lat_raw,
@@ -1188,7 +1161,6 @@ def parse_gga(response):
 def parse_qgpsloc(response):
 
     if not response:
-
         return None
 
     match = re.search(
@@ -1197,7 +1169,6 @@ def parse_qgpsloc(response):
     )
 
     if not match:
-
         return None
 
     try:
@@ -1208,7 +1179,6 @@ def parse_qgpsloc(response):
         ]
 
         if len(values) < 5:
-
             return None
 
         utc = values[0]
@@ -1248,11 +1218,19 @@ def read_gnss():
     if not modem_is_alive():
 
         with state_lock:
-
             gnss_info["gnss_status"] = "NO FIX"
+
+        print(
+            "📍 GNSS NO FIX | "
+            "LAT=None | "
+            "LON=None | "
+            "SAT=None",
+            flush=True
+        )
 
         return False
 
+    # Make sure GNSS is running
     ensure_gnss()
 
     # --------------------------------------------------------
@@ -1282,7 +1260,7 @@ def read_gnss():
     )
 
     # --------------------------------------------------------
-    # COMBINE
+    # COMBINE DATA
     # --------------------------------------------------------
 
     parsed = None
@@ -1307,38 +1285,20 @@ def read_gnss():
 
                 parsed["gnss_status"] = "FIX"
 
-                if (
-                    gga_data["latitude"]
-                    is not None
-                ):
-
+                if gga_data["latitude"] is not None:
                     parsed["latitude"] = (
                         gga_data["latitude"]
                     )
 
-                if (
-                    gga_data["longitude"]
-                    is not None
-                ):
-
+                if gga_data["longitude"] is not None:
                     parsed["longitude"] = (
                         gga_data["longitude"]
                     )
 
-                if (
-                    gga_data["altitude_m"]
-                    is not None
-                ):
-
+                if gga_data["altitude_m"] is not None:
                     parsed["altitude_m"] = (
                         gga_data["altitude_m"]
                     )
-
-            else:
-
-                if not qgpsloc_data:
-
-                    parsed["gnss_status"] = "NO FIX"
 
             parsed["satellites"] = (
                 gga_data["satellites"]
@@ -1352,51 +1312,53 @@ def read_gnss():
     # UPDATE GNSS
     # --------------------------------------------------------
 
-    if parsed:
+    if parsed and parsed["gnss_status"] == "FIX":
 
         with state_lock:
-
             gnss_info.update(parsed)
 
-        if parsed["gnss_status"] == "FIX":
+        print(
+            f"📍 GNSS FIX | "
+            f"LAT={parsed['latitude']:.8f} | "
+            f"LON={parsed['longitude']:.8f} | "
+            f"ALT={parsed['altitude_m']} m | "
+            f"SAT={parsed['satellites']}",
+            flush=True
+        )
 
-            print(
-                f"📍 GNSS FIX | "
-                f"LAT={parsed['latitude']:.8f} | "
-                f"LON={parsed['longitude']:.8f} | "
-                f"ALT={parsed['altitude_m']} m | "
-                f"SAT={parsed['satellites']}",
-                flush=True
-            )
+        return True
 
-            return True
+    # --------------------------------------------------------
+    # NO FIX
+    # --------------------------------------------------------
 
-    # No valid fix
+    satellites = None
+    gps_utc = None
+
+    if parsed:
+
+        satellites = parsed.get(
+            "satellites"
+        )
+
+        gps_utc = parsed.get(
+            "gps_utc"
+        )
+
     with state_lock:
 
         gnss_info["gnss_status"] = "NO FIX"
-
         gnss_info["latitude"] = None
-
         gnss_info["longitude"] = None
-
         gnss_info["altitude_m"] = None
-
-        if parsed:
-
-            gnss_info["satellites"] = (
-                parsed.get("satellites")
-            )
-
-            gnss_info["gps_utc"] = (
-                parsed.get("gps_utc")
-            )
+        gnss_info["satellites"] = satellites
+        gnss_info["gps_utc"] = gps_utc
 
     print(
         "📍 GNSS NO FIX | "
         "LAT=None | "
         "LON=None | "
-        f"SAT={gnss_info['satellites']}",
+        f"SAT={satellites}",
         flush=True
     )
 
@@ -1461,7 +1423,6 @@ def print_startup_gsm_information():
     update_gsm_information()
 
     with state_lock:
-
         gsm = dict(gsm_info)
 
     print(
@@ -1524,13 +1485,10 @@ def communication_worker():
     global modem_connected
 
     last_gnss_time = 0
-
     last_gsm_time = 0
-
     last_modem_check = 0
 
     first_connection_attempt = True
-
     startup_information_printed = False
 
     while not stop_event.is_set():
@@ -1552,7 +1510,6 @@ def communication_worker():
             ):
 
                 first_connection_attempt = False
-
                 last_modem_check = now
 
                 print(
@@ -1580,13 +1537,10 @@ def communication_worker():
                         # First GNSS check immediately
                         read_gnss()
 
-                        last_gnss_time = (
-                            time.monotonic()
-                        )
+                        current_time = time.monotonic()
 
-                        last_gsm_time = (
-                            time.monotonic()
-                        )
+                        last_gnss_time = current_time
+                        last_gsm_time = current_time
 
                 time.sleep(0.2)
 
@@ -1680,7 +1634,6 @@ def print_status(
     with state_lock:
 
         gsm = dict(gsm_info)
-
         gnss = dict(gnss_info)
 
     timestamp = datetime.now().strftime(
@@ -1761,7 +1714,19 @@ def main():
     # ADS1115
     # ========================================================
 
-    initialize_ads1115()
+    if not initialize_ads1115():
+
+        print(
+            "❌ ADS1115 is not available.",
+            flush=True
+        )
+
+        print(
+            "❌ Pressure monitoring cannot continue.",
+            flush=True
+        )
+
+        return
 
     # ========================================================
     # START COMMUNICATION THREAD
@@ -1783,6 +1748,9 @@ def main():
     # PRESSURE DATABASE STATE
     # ========================================================
 
+    # IMPORTANT:
+    # These variables MUST be initialized before the loop.
+
     last_raw = None
 
     first_pressure_stored = False
@@ -1797,7 +1765,7 @@ def main():
 
     try:
 
-        while True:
+        while not stop_event.is_set():
 
             loop_start = time.monotonic()
 
@@ -1806,6 +1774,19 @@ def main():
             # ------------------------------------------------
 
             current_raw = read_pressure_values()
+
+            # If ADS read failed:
+            # do not insert
+            # do not compare
+            # do not generate false pressure change
+
+            if current_raw is None:
+
+                time.sleep(
+                    PRESSURE_READ_INTERVAL
+                )
+
+                continue
 
             # ------------------------------------------------
             # FIRST PRESSURE RECORD
@@ -1837,12 +1818,7 @@ def main():
                     )
 
             # ------------------------------------------------
-            # FIRST GNSS FIX RECORD
-            #
-            # This is exactly ONE additional record.
-            #
-            # IMPORTANT:
-            # It does NOT change last_raw.
+            # FIRST GNSS FIX
             # ------------------------------------------------
 
             with state_lock:
@@ -1850,6 +1826,8 @@ def main():
                 current_gnss_status = (
                     gnss_info["gnss_status"]
                 )
+
+            # Exactly ONE GNSS-only record
 
             if (
                 first_pressure_stored
@@ -1872,7 +1850,8 @@ def main():
 
                     first_gnss_fix_stored = True
 
-                    # DO NOT CHANGE last_raw HERE
+                    # IMPORTANT:
+                    # Do NOT change last_raw here.
 
                     print(
                         "📍 FIRST GNSS FIX STORED | "
@@ -1890,20 +1869,24 @@ def main():
             ):
 
                 differences = [
+
                     abs(
                         current_raw[i]
                         - last_raw[i]
                     )
+
                     for i in range(4)
                 ]
 
                 pressure_changed = any(
+
                     diff >= RAW_THRESHOLD
+
                     for diff in differences
                 )
 
                 # ------------------------------------------------
-                # ONLY WHEN THRESHOLD IS REACHED
+                # ONLY INSERT WHEN THRESHOLD >= 326
                 # ------------------------------------------------
 
                 if pressure_changed:
@@ -1921,7 +1904,9 @@ def main():
 
                     if success:
 
-                        # Update reference ONLY after DB insert
+                        # Update reference ONLY
+                        # after successful DB insert
+
                         last_raw = current_raw
 
                         print(
@@ -1934,15 +1919,13 @@ def main():
                             flush=True
                         )
 
-                # ------------------------------------------------
                 # IMPORTANT:
                 #
-                # If threshold is NOT reached:
+                # If difference < 326:
                 #
-                # DO NOTHING.
+                # NOTHING IS PRINTED.
                 #
-                # NO "SKIP" MESSAGE.
-                # ------------------------------------------------
+                # NOTHING IS INSERTED.
 
             # ------------------------------------------------
             # LIVE STATUS EVERY 1 SECOND
@@ -1978,7 +1961,9 @@ def main():
 
             if remaining > 0:
 
-                time.sleep(remaining)
+                time.sleep(
+                    remaining
+                )
 
     except KeyboardInterrupt:
 
@@ -2011,5 +1996,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()

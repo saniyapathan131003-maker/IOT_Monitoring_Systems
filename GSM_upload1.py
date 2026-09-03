@@ -1,4 +1,4 @@
-```python
+
 #!/usr/bin/env python3
 
 import os
@@ -505,4 +505,3 @@ finally:
     print(
         "🔴 Uploader closed."
     )
-```

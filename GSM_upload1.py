@@ -55,7 +55,7 @@ MQTT_PORT = 8883
 
 CLIENT_ID = "Raspberrypi_4A"
 
-TOPIC = f"{CLIENT_ID}/data"
+TOPIC = f"{CLIENT_ID}/data/2"
 
 
 # ============================================================

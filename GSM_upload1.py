@@ -53,7 +53,7 @@ MQTT_ENDPOINT = "a1vddjuckiz90j-ats.iot.ap-south-1.amazonaws.com"
 
 MQTT_PORT = 8883
 
-CLIENT_ID = "Raspberrypi_4A"
+CLIENT_ID = "Raspberrypi_4"
 
 TOPIC = f"{CLIENT_ID}/data/2"
 

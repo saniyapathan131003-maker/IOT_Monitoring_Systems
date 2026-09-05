@@ -28,19 +28,19 @@ DB_PATH = os.path.join(
 
 CA_PATH = os.path.join(
     BASE_DIR,
-    "certs",
+    "certs_3",
     "AmazonRootCA1.pem"
 )
 
 CERT_PATH = os.path.join(
     BASE_DIR,
-    "certs",
+    "certs_3",
     "certificate.pem.crt"
 )
 
 KEY_PATH = os.path.join(
     BASE_DIR,
-    "certs",
+    "certs_3",
     "private.pem.key"
 )
 

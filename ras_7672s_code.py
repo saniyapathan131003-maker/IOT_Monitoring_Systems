@@ -1,103 +1,82 @@
 
 #!/usr/bin/env python3
 import time
-import serial
+import pigpio
 
-# USB-to-TTL adapter serial port.
-# Change this if your adapter uses another port.
-PORT = "/dev/ttyUSB0"
-BAUDRATE = 115200
+# Raspberry Pi 3A+
+TX_GPIO = 4       # Physical pin 7 -> SIM7672S RXD
+RX_GPIO = 5       # Physical pin 29 -> SIM7672S TXD
+BAUDRATE = 9600   # Must match the modem UART baud rate
 
+pi = pigpio.pi()
 
-def send_at(ser, command, wait=2):
-    """Send an AT command and collect its response."""
-    print(f"\n>>> {command}")
+if not pi.connected:
+    raise SystemExit(
+        "Cannot connect to pigpio daemon. "
+        "Start the daemon or check whether pigpio is supported."
+    )
 
-    ser.reset_input_buffer()
-    ser.write((command + "\r\n").encode("ascii"))
-    ser.flush()
+try:
+    # Configure bit-banged serial receive on GPIO5
+    pi.set_mode(RX_GPIO, pigpio.INPUT)
+    pi.set_pull_up_down(RX_GPIO, pigpio.PUD_UP)
 
-    time.sleep(wait)
-    response = ser.read_all().decode(
-        "utf-8", errors="replace"
-    ).strip()
+    # Open software UART receiver
+    result = pi.bb_serial_read_open(
+        RX_GPIO, BAUDRATE, 8
+    )
 
-    print(response if response else "No response")
-    return response
+    if result != 0:
+        raise RuntimeError(
+            f"Could not open software UART RX: {result}"
+        )
 
+    print("SIM7672S software UART AT test")
+    print("TX GPIO4 / RX GPIO5 / baud:", BAUDRATE)
+    print("Type AT, ATI, AT+CPIN?, AT+CSQ, or exit.")
 
-def main():
+    while True:
+        command = input("AT> ").strip()
+
+        if command.lower() == "exit":
+            break
+
+        if not command:
+            continue
+
+        # Transmit command on GPIO4
+        pi.wave_clear()
+        pi.wave_add_serial(
+            TX_GPIO, BAUDRATE,
+            command + "\r\n"
+        )
+        wave_id = pi.wave_create()
+
+        if wave_id < 0:
+            print("Could not create TX waveform.")
+            continue
+
+        pi.wave_send_once(wave_id)
+
+        while pi.wave_tx_busy():
+            time.sleep(0.01)
+
+        pi.wave_delete(wave_id)
+
+        # Collect response from GPIO5
+        time.sleep(1)
+        count, data = pi.bb_serial_read(RX_GPIO)
+
+        if count:
+            print(data.decode("utf-8", errors="replace"))
+        else:
+            print("No response. Check baud rate, wiring, "
+                  "modem power and UART configuration.")
+
+finally:
     try:
-        with serial.Serial(
-            PORT,
-            BAUDRATE,
-            timeout=0.5,
-            write_timeout=2
-        ) as ser:
+        pi.bb_serial_read_close(RX_GPIO)
+    except Exception:
+        pass
 
-            time.sleep(2)
-            ser.reset_input_buffer()
-
-            print("SIM7672S AT / GPS / GNSS TEST")
-            print("Serial port:", PORT)
-            print("Baud rate:", BAUDRATE)
-
-            # Basic modem and SIM tests
-            send_at(ser, "AT")
-            send_at(ser, "ATE0")
-            send_at(ser, "ATI")
-            send_at(ser, "AT+CPIN?")
-            send_at(ser, "AT+CSQ")
-            send_at(ser, "AT+CREG?")
-            send_at(ser, "AT+CEREG?")
-            send_at(ser, "AT+CGATT?")
-
-            # GNSS capability check and power on
-            send_at(ser, "AT+CGNSSPWR?")
-            send_at(ser, "AT+CGNSSPWR=1", wait=3)
-
-            print("\nWaiting for GNSS location.")
-            print("Place the antenna outdoors with a clear sky view.")
-            print("A first fix may take several minutes.")
-
-            # Allow time for the receiver to acquire satellites.
-            for attempt in range(1, 31):
-                print(f"\n--- GNSS check {attempt}/30 ---")
-
-                info = send_at(
-                    ser, "AT+CGNSSINFO", wait=2
-                )
-
-                gps = send_at(
-                    ser, "AT+CGPSINFO", wait=1
-                )
-
-                if (
-                    info and
-                    "+CGNSSINFO:" in info and
-                    "+CGNSSINFO: ," not in info
-                ):
-                    print("GNSS information received.")
-
-                if (
-                    gps and
-                    "+CGPSINFO:" in gps and
-                    "+CGPSINFO: ," not in gps
-                ):
-                    print("GPS information received.")
-
-                time.sleep(3)
-
-            print("\nTest finished.")
-            print("Check responses above for AT OK and valid coordinates.")
-
-    except serial.SerialException as exc:
-        print("Serial error:", exc)
-        print("Check the port, cable, permissions and wiring.")
-
-    except KeyboardInterrupt:
-        print("\nTest stopped by user.")
-
-
-if __name__ == "__main__":
-    main()
+    pi.stop()
